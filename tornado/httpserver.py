@@ -27,20 +27,15 @@ class except to start a server at the beginning of the process
 
 import socket
 import ssl
+import typing
+from collections.abc import Awaitable, Callable
+from typing import Any
 
+from tornado import httputil, iostream, netutil
 from tornado.escape import native_str
-from tornado.http1connection import HTTP1ServerConnection, HTTP1ConnectionParameters
-from tornado import httputil
-from tornado import iostream
-from tornado import netutil
+from tornado.http1connection import HTTP1ConnectionParameters, HTTP1ServerConnection
 from tornado.tcpserver import TCPServer
 from tornado.util import Configurable
-
-import typing
-from typing import Union, Any, Dict, Callable, List, Type, Tuple, Optional, Awaitable
-
-if typing.TYPE_CHECKING:
-    from typing import Set  # noqa: F401
 
 
 class HTTPServer(TCPServer, Configurable, httputil.HTTPServerConnectionDelegate):
@@ -74,7 +69,7 @@ class HTTPServer(TCPServer, Configurable, httputil.HTTPServerConnectionDelegate)
     To make this server serve SSL traffic, send the ``ssl_options`` keyword
     argument with an `ssl.SSLContext` object. For compatibility with older
     versions of Python ``ssl_options`` may also be a dictionary of keyword
-    arguments for the `ssl.wrap_socket` method.::
+    arguments for the `ssl.SSLContext.wrap_socket` method.::
 
        ssl_ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
        ssl_ctx.load_cert_chain(os.path.join(data_dir, "mydomain.crt"),
@@ -84,41 +79,53 @@ class HTTPServer(TCPServer, Configurable, httputil.HTTPServerConnectionDelegate)
     `HTTPServer` initialization follows one of three patterns (the
     initialization methods are defined on `tornado.tcpserver.TCPServer`):
 
-    1. `~tornado.tcpserver.TCPServer.listen`: simple single-process::
+    1. `~tornado.tcpserver.TCPServer.listen`: single-process::
 
-            server = HTTPServer(app)
-            server.listen(8888)
-            IOLoop.current().start()
+            async def main():
+                server = HTTPServer()
+                server.listen(8888)
+                await asyncio.Event().wait()
+
+            asyncio.run(main())
 
        In many cases, `tornado.web.Application.listen` can be used to avoid
        the need to explicitly create the `HTTPServer`.
 
-    2. `~tornado.tcpserver.TCPServer.bind`/`~tornado.tcpserver.TCPServer.start`:
-       simple multi-process::
+       While this example does not create multiple processes on its own, when
+       the ``reuse_port=True`` argument is passed to ``listen()`` you can run
+       the program multiple times to create a multi-process service.
 
-            server = HTTPServer(app)
+    2. `~tornado.tcpserver.TCPServer.add_sockets`: multi-process::
+
+            sockets = bind_sockets(8888)
+            tornado.process.fork_processes(0)
+            async def post_fork_main():
+                server = HTTPServer()
+                server.add_sockets(sockets)
+                await asyncio.Event().wait()
+            asyncio.run(post_fork_main())
+
+       The ``add_sockets`` interface is more complicated, but it can be used with
+       `tornado.process.fork_processes` to run a multi-process service with all
+       worker processes forked from a single parent.  ``add_sockets`` can also be
+       used in single-process servers if you want to create your listening
+       sockets in some way other than `~tornado.netutil.bind_sockets`.
+
+       Note that when using this pattern, nothing that touches the event loop
+       can be run before ``fork_processes``.
+
+    3. `~tornado.tcpserver.TCPServer.bind`/`~tornado.tcpserver.TCPServer.start`:
+       simple **deprecated** multi-process::
+
+            server = HTTPServer()
             server.bind(8888)
             server.start(0)  # Forks multiple sub-processes
             IOLoop.current().start()
 
-       When using this interface, an `.IOLoop` must *not* be passed
-       to the `HTTPServer` constructor.  `~.TCPServer.start` will always start
-       the server on the default singleton `.IOLoop`.
-
-    3. `~tornado.tcpserver.TCPServer.add_sockets`: advanced multi-process::
-
-            sockets = tornado.netutil.bind_sockets(8888)
-            tornado.process.fork_processes(0)
-            server = HTTPServer(app)
-            server.add_sockets(sockets)
-            IOLoop.current().start()
-
-       The `~.TCPServer.add_sockets` interface is more complicated,
-       but it can be used with `tornado.process.fork_processes` to
-       give you more flexibility in when the fork happens.
-       `~.TCPServer.add_sockets` can also be used in single-process
-       servers if you want to create your listening sockets in some
-       way other than `tornado.netutil.bind_sockets`.
+       This pattern is deprecated because it requires interfaces in the
+       `asyncio` module that have been deprecated since Python 3.10. Support for
+       creating multiple processes in the ``start`` method will be removed in a
+       future version of Tornado.
 
     .. versionchanged:: 4.0
        Added ``decompress_request``, ``chunk_size``, ``max_header_size``,
@@ -151,22 +158,22 @@ class HTTPServer(TCPServer, Configurable, httputil.HTTPServerConnectionDelegate)
 
     def initialize(
         self,
-        request_callback: Union[
-            httputil.HTTPServerConnectionDelegate,
-            Callable[[httputil.HTTPServerRequest], None],
-        ],
+        request_callback: (
+            httputil.HTTPServerConnectionDelegate
+            | Callable[[httputil.HTTPServerRequest], None]
+        ),
         no_keep_alive: bool = False,
         xheaders: bool = False,
-        ssl_options: Optional[Union[Dict[str, Any], ssl.SSLContext]] = None,
-        protocol: Optional[str] = None,
+        ssl_options: dict[str, Any] | ssl.SSLContext | None = None,
+        protocol: str | None = None,
         decompress_request: bool = False,
-        chunk_size: Optional[int] = None,
-        max_header_size: Optional[int] = None,
-        idle_connection_timeout: Optional[float] = None,
-        body_timeout: Optional[float] = None,
-        max_body_size: Optional[int] = None,
-        max_buffer_size: Optional[int] = None,
-        trusted_downstream: Optional[List[str]] = None,
+        chunk_size: int | None = None,
+        max_header_size: int | None = None,
+        idle_connection_timeout: float | None = None,
+        body_timeout: float | None = None,
+        max_body_size: int | None = None,
+        max_buffer_size: int | None = None,
+        trusted_downstream: list[str] | None = None,
     ) -> None:
         # This method's signature is not extracted with autodoc
         # because we want its arguments to appear on the class
@@ -190,15 +197,15 @@ class HTTPServer(TCPServer, Configurable, httputil.HTTPServerConnectionDelegate)
             max_buffer_size=max_buffer_size,
             read_chunk_size=chunk_size,
         )
-        self._connections = set()  # type: Set[HTTP1ServerConnection]
+        self._connections: set[HTTP1ServerConnection] = set()
         self.trusted_downstream = trusted_downstream
 
     @classmethod
-    def configurable_base(cls) -> Type[Configurable]:
+    def configurable_base(cls) -> type[Configurable]:
         return HTTPServer
 
     @classmethod
-    def configurable_default(cls) -> Type[Configurable]:
+    def configurable_default(cls) -> type[Configurable]:
         return HTTPServer
 
     async def close_all_connections(self) -> None:
@@ -220,7 +227,9 @@ class HTTPServer(TCPServer, Configurable, httputil.HTTPServerConnectionDelegate)
             conn = next(iter(self._connections))
             await conn.close()
 
-    def handle_stream(self, stream: iostream.IOStream, address: Tuple) -> None:
+    def handle_stream(
+        self, stream: iostream.IOStream, address: tuple[Any, ...]
+    ) -> None:
         context = _HTTPRequestContext(
             stream, address, self.protocol, self.trusted_downstream
         )
@@ -253,15 +262,15 @@ class _CallableAdapter(httputil.HTTPMessageDelegate):
     ) -> None:
         self.connection = request_conn
         self.request_callback = request_callback
-        self.request = None  # type: Optional[httputil.HTTPServerRequest]
+        self.request: httputil.HTTPServerRequest | None = None
         self.delegate = None
-        self._chunks = []  # type: List[bytes]
+        self._chunks = bytearray()
 
     def headers_received(
         self,
-        start_line: Union[httputil.RequestStartLine, httputil.ResponseStartLine],
+        start_line: httputil.RequestStartLine | httputil.ResponseStartLine,
         headers: httputil.HTTPHeaders,
-    ) -> Optional[Awaitable[None]]:
+    ) -> Awaitable[None] | None:
         self.request = httputil.HTTPServerRequest(
             connection=self.connection,
             start_line=typing.cast(httputil.RequestStartLine, start_line),
@@ -269,13 +278,13 @@ class _CallableAdapter(httputil.HTTPMessageDelegate):
         )
         return None
 
-    def data_received(self, chunk: bytes) -> Optional[Awaitable[None]]:
-        self._chunks.append(chunk)
+    def data_received(self, chunk: bytes) -> Awaitable[None] | None:
+        self._chunks += chunk
         return None
 
     def finish(self) -> None:
         assert self.request is not None
-        self.request.body = b"".join(self._chunks)
+        self.request.body = bytes(self._chunks)
         self.request._parse_body()
         self.request_callback(self.request)
 
@@ -283,13 +292,13 @@ class _CallableAdapter(httputil.HTTPMessageDelegate):
         del self._chunks
 
 
-class _HTTPRequestContext(object):
+class _HTTPRequestContext:
     def __init__(
         self,
         stream: iostream.IOStream,
-        address: Tuple,
-        protocol: Optional[str],
-        trusted_downstream: Optional[List[str]] = None,
+        address: tuple[Any, ...],
+        protocol: str | None,
+        trusted_downstream: list[str] | None = None,
     ) -> None:
         self.address = address
         # Save the socket's address family now so we know how to
@@ -304,7 +313,7 @@ class _HTTPRequestContext(object):
             self.address_family in (socket.AF_INET, socket.AF_INET6)
             and address is not None
         ):
-            self.remote_ip = address[0]
+            self.remote_ip: str = address[0]
         else:
             # Unix (or other) socket; fake the remote address.
             self.remote_ip = "0.0.0.0"
@@ -372,15 +381,15 @@ class _ProxyAdapter(httputil.HTTPMessageDelegate):
 
     def headers_received(
         self,
-        start_line: Union[httputil.RequestStartLine, httputil.ResponseStartLine],
+        start_line: httputil.RequestStartLine | httputil.ResponseStartLine,
         headers: httputil.HTTPHeaders,
-    ) -> Optional[Awaitable[None]]:
+    ) -> Awaitable[None] | None:
         # TODO: either make context an official part of the
         # HTTPConnection interface or figure out some other way to do this.
         self.connection.context._apply_xheaders(headers)  # type: ignore
         return self.delegate.headers_received(start_line, headers)
 
-    def data_received(self, chunk: bytes) -> Optional[Awaitable[None]]:
+    def data_received(self, chunk: bytes) -> Awaitable[None] | None:
         return self.delegate.data_received(chunk)
 
     def finish(self) -> None:

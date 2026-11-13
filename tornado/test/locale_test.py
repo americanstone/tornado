@@ -1,15 +1,19 @@
+import codecs
 import datetime
 import os
 import shutil
 import tempfile
-import unittest
+import typing
 
 import tornado.locale
-from tornado.escape import utf8, to_unicode
+from tornado.escape import to_unicode, utf8
 from tornado.util import unicode_type
 
 
-class TranslationLoaderTest(unittest.TestCase):
+from tornado.test.util import TestCase
+
+
+class TranslationLoaderTest(TestCase):
     # TODO: less hacky way to get isolated tests
     SAVE_VARS = ["_translations", "_supported_locales", "_use_gettext"]
 
@@ -17,7 +21,7 @@ class TranslationLoaderTest(unittest.TestCase):
         tornado.locale.Locale._cache = {}
 
     def setUp(self):
-        self.saved = {}  # type: dict
+        self.saved: dict[str, typing.Any] = {}
         for var in TranslationLoaderTest.SAVE_VARS:
             self.saved[var] = getattr(tornado.locale, var)
         self.clear_locale_cache()
@@ -33,7 +37,7 @@ class TranslationLoaderTest(unittest.TestCase):
         )
         locale = tornado.locale.get("fr_FR")
         self.assertTrue(isinstance(locale, tornado.locale.CSVLocale))
-        self.assertEqual(locale.translate("school"), u"\u00e9cole")
+        self.assertEqual(locale.translate("school"), "\u00e9cole")
 
     def test_csv_bom(self):
         with open(
@@ -53,9 +57,42 @@ class TranslationLoaderTest(unittest.TestCase):
                 tornado.locale.load_translations(tmpdir)
                 locale = tornado.locale.get("fr_FR")
                 self.assertIsInstance(locale, tornado.locale.CSVLocale)
-                self.assertEqual(locale.translate("school"), u"\u00e9cole")
+                self.assertEqual(locale.translate("school"), "\u00e9cole")
             finally:
                 shutil.rmtree(tmpdir)
+
+    def test_csv_mixed_encodings(self):
+        for utf8_encoding in ["utf-8", "utf-8-sig"]:
+            for utf16_encoding, bom in [
+                ("utf-16-le", codecs.BOM_UTF16_LE),
+                ("utf-16-be", codecs.BOM_UTF16_BE),
+            ]:
+                with self.subTest(utf8=utf8_encoding, utf16=utf16_encoding):
+                    self.clear_locale_cache()
+                    with tempfile.TemporaryDirectory() as tmpdir:
+                        with open(os.path.join(tmpdir, "fr_FR.csv"), "wb") as f:
+                            f.write("school,\u00e9cole\n".encode(utf8_encoding))
+                        with open(os.path.join(tmpdir, "de_DE.csv"), "wb") as f:
+                            f.write(bom + "school,Schule\n".encode(utf16_encoding))
+                        tornado.locale.load_translations(tmpdir)
+                        self.assertEqual(
+                            tornado.locale.get("fr_FR").translate("school"),
+                            "\u00e9cole",
+                        )
+                        self.assertEqual(
+                            tornado.locale.get("de_DE").translate("school"), "Schule"
+                        )
+
+    def test_csv_explicit_encoding(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            for code, translation in [("fr_FR", "\u00e9cole"), ("es_ES", "ni\u00f1o")]:
+                with open(os.path.join(tmpdir, code + ".csv"), "wb") as f:
+                    f.write(("word," + translation + "\n").encode("latin1"))
+            tornado.locale.load_translations(tmpdir, encoding="latin1")
+            self.assertEqual(
+                tornado.locale.get("fr_FR").translate("word"), "\u00e9cole"
+            )
+            self.assertEqual(tornado.locale.get("es_ES").translate("word"), "ni\u00f1o")
 
     def test_gettext(self):
         tornado.locale.load_gettext_translations(
@@ -64,28 +101,26 @@ class TranslationLoaderTest(unittest.TestCase):
         )
         locale = tornado.locale.get("fr_FR")
         self.assertTrue(isinstance(locale, tornado.locale.GettextLocale))
-        self.assertEqual(locale.translate("school"), u"\u00e9cole")
-        self.assertEqual(locale.pgettext("law", "right"), u"le droit")
-        self.assertEqual(locale.pgettext("good", "right"), u"le bien")
+        self.assertEqual(locale.translate("school"), "\u00e9cole")
+        self.assertEqual(locale.pgettext("law", "right"), "le droit")
+        self.assertEqual(locale.pgettext("good", "right"), "le bien")
+        self.assertEqual(locale.pgettext("organization", "club", "clubs", 1), "le club")
         self.assertEqual(
-            locale.pgettext("organization", "club", "clubs", 1), u"le club"
+            locale.pgettext("organization", "club", "clubs", 2), "les clubs"
         )
-        self.assertEqual(
-            locale.pgettext("organization", "club", "clubs", 2), u"les clubs"
-        )
-        self.assertEqual(locale.pgettext("stick", "club", "clubs", 1), u"le b\xe2ton")
-        self.assertEqual(locale.pgettext("stick", "club", "clubs", 2), u"les b\xe2tons")
+        self.assertEqual(locale.pgettext("stick", "club", "clubs", 1), "le b\xe2ton")
+        self.assertEqual(locale.pgettext("stick", "club", "clubs", 2), "les b\xe2tons")
 
 
-class LocaleDataTest(unittest.TestCase):
+class LocaleDataTest(TestCase):
     def test_non_ascii_name(self):
         name = tornado.locale.LOCALE_NAMES["es_LA"]["name"]
         self.assertTrue(isinstance(name, unicode_type))
-        self.assertEqual(name, u"Espa\u00f1ol")
+        self.assertEqual(name, "Espa\u00f1ol")
         self.assertEqual(utf8(name), b"Espa\xc3\xb1ol")
 
 
-class EnglishTest(unittest.TestCase):
+class EnglishTest(TestCase):
     def test_format_date(self):
         locale = tornado.locale.get("en_US")
         date = datetime.datetime(2013, 4, 28, 18, 35)
@@ -93,44 +128,105 @@ class EnglishTest(unittest.TestCase):
             locale.format_date(date, full_format=True), "April 28, 2013 at 6:35 pm"
         )
 
-        now = datetime.datetime.utcnow()
+        aware_dt = datetime.datetime.now(datetime.UTC)
+        naive_dt = aware_dt.replace(tzinfo=None)
+        for name, now in {"aware": aware_dt, "naive": naive_dt}.items():
+            with self.subTest(dt=name):
+                self.assertEqual(
+                    locale.format_date(
+                        now - datetime.timedelta(seconds=2), full_format=False
+                    ),
+                    "2 seconds ago",
+                )
+                self.assertEqual(
+                    locale.format_date(
+                        now - datetime.timedelta(minutes=2), full_format=False
+                    ),
+                    "2 minutes ago",
+                )
+                self.assertEqual(
+                    locale.format_date(
+                        now - datetime.timedelta(hours=2), full_format=False
+                    ),
+                    "2 hours ago",
+                )
 
-        self.assertEqual(
-            locale.format_date(now - datetime.timedelta(seconds=2), full_format=False),
-            "2 seconds ago",
-        )
-        self.assertEqual(
-            locale.format_date(now - datetime.timedelta(minutes=2), full_format=False),
-            "2 minutes ago",
-        )
-        self.assertEqual(
-            locale.format_date(now - datetime.timedelta(hours=2), full_format=False),
-            "2 hours ago",
-        )
+                self.assertEqual(
+                    locale.format_date(
+                        now - datetime.timedelta(days=1),
+                        full_format=False,
+                        shorter=True,
+                    ),
+                    "yesterday",
+                )
 
+                date = now - datetime.timedelta(days=2)
+                self.assertEqual(
+                    locale.format_date(date, full_format=False, shorter=True),
+                    locale._weekdays[date.weekday()],
+                )
+
+                date = now - datetime.timedelta(days=300)
+                self.assertEqual(
+                    locale.format_date(date, full_format=False, shorter=True),
+                    "%s %d" % (locale._months[date.month - 1], date.day),
+                )
+
+                date = now - datetime.timedelta(days=500)
+                self.assertEqual(
+                    locale.format_date(date, full_format=False, shorter=True),
+                    "%s %d, %d" % (locale._months[date.month - 1], date.day, date.year),
+                )
+
+                date = now + datetime.timedelta(days=1, seconds=30)
+                self.assertEqual(
+                    locale.format_date(date, full_format=False, shorter=True),
+                    "%s %d, %d" % (locale._months[date.month - 1], date.day, date.year),
+                )
+
+    def test_format_date_non_utc(self):
+        locale = tornado.locale.get("en_US")
+        utc_date = datetime.datetime(2013, 4, 28, 23, 35, tzinfo=datetime.UTC)
+        for input_offset in [330, -420, 840, -720]:
+            date = utc_date.astimezone(
+                datetime.timezone(datetime.timedelta(minutes=input_offset))
+            )
+            for gmt_offset, expected in [
+                (0, "April 28, 2013 at 11:35 pm"),
+                (-120, "April 29, 2013 at 1:35 am"),
+                (300, "April 28, 2013 at 6:35 pm"),
+            ]:
+                with self.subTest(input_offset=input_offset, gmt_offset=gmt_offset):
+                    self.assertEqual(
+                        locale.format_date(
+                            date, gmt_offset=gmt_offset, full_format=True
+                        ),
+                        expected,
+                    )
+                    self.assertEqual(
+                        locale.format_date(
+                            date, gmt_offset=gmt_offset, full_format=True
+                        ),
+                        locale.format_date(
+                            utc_date.timestamp(),
+                            gmt_offset=gmt_offset,
+                            full_format=True,
+                        ),
+                    )
+
+    def test_format_date_non_utc_yesterday(self):
+        locale = tornado.locale.get("en_US")
+        # A large input offset changes the calendar date, but must not
+        # change whether an instant is displayed as yesterday.
+        now = datetime.datetime.now(datetime.UTC)
+        yesterday = now - datetime.timedelta(days=1)
+        offset = 840 if now.hour >= 10 else -720
+        date = yesterday.astimezone(
+            datetime.timezone(datetime.timedelta(minutes=offset))
+        )
         self.assertEqual(
-            locale.format_date(
-                now - datetime.timedelta(days=1), full_format=False, shorter=True
-            ),
+            locale.format_date(date, shorter=True),
             "yesterday",
-        )
-
-        date = now - datetime.timedelta(days=2)
-        self.assertEqual(
-            locale.format_date(date, full_format=False, shorter=True),
-            locale._weekdays[date.weekday()],
-        )
-
-        date = now - datetime.timedelta(days=300)
-        self.assertEqual(
-            locale.format_date(date, full_format=False, shorter=True),
-            "%s %d" % (locale._months[date.month - 1], date.day),
-        )
-
-        date = now - datetime.timedelta(days=500)
-        self.assertEqual(
-            locale.format_date(date, full_format=False, shorter=True),
-            "%s %d, %d" % (locale._months[date.month - 1], date.day, date.year),
         )
 
     def test_friendly_number(self):

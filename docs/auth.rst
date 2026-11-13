@@ -3,7 +3,7 @@
 
 .. testsetup::
 
-   import tornado.auth, tornado.gen, tornado.web
+   import tornado
 
 .. automodule:: tornado.auth
 
@@ -15,9 +15,6 @@
    The degree of customization required will vary, but in most cases
    overriding the class attributes (which are named beginning with
    underscores for historical reasons) should be sufficient.
-
-   .. autoclass:: OpenIdMixin
-      :members:
 
    .. autoclass:: OAuthMixin
 

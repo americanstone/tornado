@@ -1,9 +1,9 @@
+.. image:: docs/tornado.png?raw=true
+   :alt: Tornado Web
+   :align: center
+
 Tornado Web Server
 ==================
-
-.. image:: https://badges.gitter.im/Join%20Chat.svg
-   :alt: Join the chat at https://gitter.im/tornadoweb/tornado
-   :target: https://gitter.im/tornadoweb/tornado?utm_source=badge&utm_medium=badge&utm_campaign=pr-badge&utm_content=badge
 
 `Tornado <http://www.tornadoweb.org>`_ is a Python web framework and
 asynchronous networking library, originally developed at `FriendFeed
@@ -20,8 +20,8 @@ Here is a simple "Hello, world" example web app for Tornado:
 
 .. code-block:: python
 
-    import tornado.ioloop
-    import tornado.web
+    import asyncio
+    import tornado
 
     class MainHandler(tornado.web.RequestHandler):
         def get(self):
@@ -32,10 +32,13 @@ Here is a simple "Hello, world" example web app for Tornado:
             (r"/", MainHandler),
         ])
 
-    if __name__ == "__main__":
+    async def main():
         app = make_app()
         app.listen(8888)
-        tornado.ioloop.IOLoop.current().start()
+        await asyncio.Event().wait()
+
+    if __name__ == "__main__":
+        asyncio.run(main())
 
 This example does not use any of Tornado's asynchronous features; for
 that see this `simple chat room

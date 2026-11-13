@@ -1,30 +1,3 @@
-from tornado.concurrent import Future
-from tornado import gen
-from tornado import netutil
-from tornado.ioloop import IOLoop
-from tornado.iostream import (
-    IOStream,
-    SSLIOStream,
-    PipeIOStream,
-    StreamClosedError,
-    _StreamBuffer,
-)
-from tornado.httputil import HTTPHeaders
-from tornado.locks import Condition, Event
-from tornado.log import gen_log
-from tornado.netutil import ssl_wrap_socket
-from tornado.platform.asyncio import AddThreadSelectorEventLoop
-from tornado.tcpserver import TCPServer
-from tornado.testing import (
-    AsyncHTTPTestCase,
-    AsyncHTTPSTestCase,
-    AsyncTestCase,
-    bind_unused_port,
-    ExpectLog,
-    gen_test,
-)
-from tornado.test.util import skipIfNonUnix, refusing_port, skipPypy3V58
-from tornado.web import RequestHandler, Application
 import asyncio
 import errno
 import hashlib
@@ -34,9 +7,41 @@ import platform
 import random
 import socket
 import ssl
+import sys
 import typing
-from unittest import mock
 import unittest
+from unittest import mock
+
+from tornado import gen, netutil
+from tornado.concurrent import Future
+from tornado.httpclient import AsyncHTTPClient, HTTPResponse
+from tornado.httputil import HTTPHeaders
+from tornado.ioloop import IOLoop
+from tornado.iostream import (
+    IOStream,
+    PipeIOStream,
+    SSLIOStream,
+    StreamBufferFullError,
+    StreamClosedError,
+    _StreamBuffer,
+)
+from tornado.locks import Condition, Event
+from tornado.log import gen_log
+from tornado.netutil import ssl_options_to_context, ssl_wrap_socket
+from tornado.platform.asyncio import AddThreadSelectorEventLoop
+from tornado.tcpserver import TCPServer
+from tornado.test.util import (
+    AsyncHTTPSTestCase,
+    AsyncHTTPTestCase,
+    AsyncTestCase,
+    TestCase,
+    abstract_base_test,
+    ignore_deprecation,
+    refusing_port,
+    skipIfNonUnix,
+)
+from tornado.testing import ExpectLog, bind_unused_port, gen_test
+from tornado.web import Application, RequestHandler
 
 
 def _server_ssl_options():
@@ -51,25 +56,53 @@ class HelloHandler(RequestHandler):
         self.write("Hello")
 
 
-class TestIOStreamWebMixin(object):
+@abstract_base_test
+class TestIOStreamWebMixin(AsyncTestCase):
+    # We want to run these tests with both AsyncHTTPTestCase and AsyncHTTPSTestCase,
+    # but this leads to some tricky inheritance situations. We want this class's
+    # get_app, but the test classes's get_http_port and fetch. There's no way to make
+    # the method resolution order to do what we want in all cases, so the current
+    # state is that that AsyncHTTP(S)TestCase must be the first base class of the
+    # final class, and that class must define a get_app method that calls mixin_get_app.
+    #
+    # Alternatives include defining this class in a factory that can change the base class
+    # or refactoring to use composition instead of inheritance for the http components.
     def _make_client_iostream(self):
         raise NotImplementedError()
 
-    def get_app(self):
+    def mixin_get_app(self):
         return Application([("/", HelloHandler)])
 
-    def test_connection_closed(self: typing.Any):
+    def get_http_port(self) -> int:
+        raise NotImplementedError()
+
+    def fetch(
+        self, path: str, raise_error: bool = False, **kwargs: typing.Any
+    ) -> HTTPResponse:
+        # To be filled in by mixing in AsyncHTTPTestCase or AsyncHTTPSTestCase
+        raise NotImplementedError()
+
+    def test_connection_closed(self):
         # When a server sends a response and then closes the connection,
         # the client must be allowed to read the data before the IOStream
         # closes itself.  Epoll reports closed connections with a separate
         # EPOLLRDHUP event delivered at the same time as the read event,
         # while kqueue reports them as a second read/write event with an EOF
         # flag.
+        if (
+            AsyncHTTPClient.configured_class().__name__.endswith("CurlAsyncHTTPClient")
+            and platform.system() == "Darwin"
+        ):
+            # It's possible that this is Tornado's fault, either in AsyncIOLoop or in
+            # CurlAsyncHTTPClient, but we've also seen this kind of issue in libcurl itself
+            # (especially a long time ago). The error is tied to the use of Apple's
+            # SecureTransport instead of OpenSSL.
+            self.skipTest("libcurl doesn't handle closed connections cleanly on macOS")
         response = self.fetch("/", headers={"Connection": "close"})
         response.rethrow()
 
     @gen_test
-    def test_read_until_close(self: typing.Any):
+    def test_read_until_close(self):
         stream = self._make_client_iostream()
         yield stream.connect(("127.0.0.1", self.get_http_port()))
         stream.write(b"GET / HTTP/1.0\r\n\r\n")
@@ -79,7 +112,7 @@ class TestIOStreamWebMixin(object):
         self.assertTrue(data.endswith(b"Hello"))
 
     @gen_test
-    def test_read_zero_bytes(self: typing.Any):
+    def test_read_zero_bytes(self):
         self.stream = self._make_client_iostream()
         yield self.stream.connect(("127.0.0.1", self.get_http_port()))
         self.stream.write(b"GET / HTTP/1.0\r\n\r\n")
@@ -99,7 +132,7 @@ class TestIOStreamWebMixin(object):
         self.stream.close()
 
     @gen_test
-    def test_write_while_connecting(self: typing.Any):
+    def test_write_while_connecting(self):
         stream = self._make_client_iostream()
         connect_fut = stream.connect(("127.0.0.1", self.get_http_port()))
         # unlike the previous tests, try to write before the connection
@@ -121,7 +154,7 @@ class TestIOStreamWebMixin(object):
         stream.close()
 
     @gen_test
-    def test_future_interface(self: typing.Any):
+    def test_future_interface(self):
         """Basic test of IOStream's ability to return Futures."""
         stream = self._make_client_iostream()
         connect_result = yield stream.connect(("127.0.0.1", self.get_http_port()))
@@ -138,7 +171,7 @@ class TestIOStreamWebMixin(object):
         stream.close()
 
     @gen_test
-    def test_future_close_while_reading(self: typing.Any):
+    def test_future_close_while_reading(self):
         stream = self._make_client_iostream()
         yield stream.connect(("127.0.0.1", self.get_http_port()))
         yield stream.write(b"GET / HTTP/1.0\r\n\r\n")
@@ -147,7 +180,7 @@ class TestIOStreamWebMixin(object):
         stream.close()
 
     @gen_test
-    def test_future_read_until_close(self: typing.Any):
+    def test_future_read_until_close(self):
         # Ensure that the data comes through before the StreamClosedError.
         stream = self._make_client_iostream()
         yield stream.connect(("127.0.0.1", self.get_http_port()))
@@ -162,7 +195,8 @@ class TestIOStreamWebMixin(object):
             stream.read_bytes(1)
 
 
-class TestReadWriteMixin(object):
+@abstract_base_test
+class TestReadWriteMixin(AsyncTestCase):
     # Tests where one stream reads and the other writes.
     # These should work for BaseIOStream implementations.
 
@@ -200,7 +234,7 @@ class TestReadWriteMixin(object):
         rs.close()
 
     @gen_test
-    def test_future_delayed_close_callback(self: typing.Any):
+    def test_future_delayed_close_callback(self):
         # Same as test_delayed_close_callback, but with the future interface.
         rs, ws = yield self.make_iostream_pair()
 
@@ -216,7 +250,7 @@ class TestReadWriteMixin(object):
             rs.close()
 
     @gen_test
-    def test_close_buffered_data(self: typing.Any):
+    def test_close_buffered_data(self):
         # Similar to the previous test, but with data stored in the OS's
         # socket buffers instead of the IOStream's read buffer.  Out-of-band
         # close notifications must be delayed until all data has been
@@ -242,7 +276,7 @@ class TestReadWriteMixin(object):
             rs.close()
 
     @gen_test
-    def test_read_until_close_after_close(self: typing.Any):
+    def test_read_until_close_after_close(self):
         # Similar to test_delayed_close_callback, but read_until_close takes
         # a separate code path so test it separately.
         rs, ws = yield self.make_iostream_pair()
@@ -261,7 +295,7 @@ class TestReadWriteMixin(object):
             rs.close()
 
     @gen_test
-    def test_large_read_until(self: typing.Any):
+    def test_large_read_until(self):
         # Performance test: read_until used to have a quadratic component
         # so a read_until of 4MB would take 8 seconds; now it takes 0.25
         # seconds.
@@ -310,7 +344,7 @@ class TestReadWriteMixin(object):
             await rf
 
     @gen_test
-    async def test_read_until_unsatisfied_after_close(self: typing.Any):
+    async def test_read_until_unsatisfied_after_close(self):
         # If a stream is closed while reading, it raises
         # StreamClosedError instead of UnsatisfiableReadError (the
         # latter should only be raised when byte limits are reached).
@@ -324,7 +358,7 @@ class TestReadWriteMixin(object):
                 await rf
 
     @gen_test
-    def test_close_callback_with_pending_read(self: typing.Any):
+    def test_close_callback_with_pending_read(self):
         # Regression test for a bug that was introduced in 2.3
         # where the IOStream._close_callback would never be called
         # if there were pending reads.
@@ -348,7 +382,7 @@ class TestReadWriteMixin(object):
             rs.close()
 
     @gen_test
-    def test_future_close_callback(self: typing.Any):
+    def test_future_close_callback(self):
         # Regression test for interaction between the Future read interfaces
         # and IOStream._maybe_add_error_listener.
         rs, ws = yield self.make_iostream_pair()
@@ -373,7 +407,7 @@ class TestReadWriteMixin(object):
             ws.close()
 
     @gen_test
-    def test_write_memoryview(self: typing.Any):
+    def test_write_memoryview(self):
         rs, ws = yield self.make_iostream_pair()
         try:
             fut = rs.read_bytes(4)
@@ -385,7 +419,7 @@ class TestReadWriteMixin(object):
             rs.close()
 
     @gen_test
-    def test_read_bytes_partial(self: typing.Any):
+    def test_read_bytes_partial(self):
         rs, ws = yield self.make_iostream_pair()
         try:
             # Ask for more than is available with partial=True
@@ -410,7 +444,7 @@ class TestReadWriteMixin(object):
             rs.close()
 
     @gen_test
-    def test_read_until_max_bytes(self: typing.Any):
+    def test_read_until_max_bytes(self):
         rs, ws = yield self.make_iostream_pair()
         closed = Event()
         rs.set_close_callback(closed.set)
@@ -438,7 +472,7 @@ class TestReadWriteMixin(object):
             rs.close()
 
     @gen_test
-    def test_read_until_max_bytes_inline(self: typing.Any):
+    def test_read_until_max_bytes_inline(self):
         rs, ws = yield self.make_iostream_pair()
         closed = Event()
         rs.set_close_callback(closed.set)
@@ -457,7 +491,7 @@ class TestReadWriteMixin(object):
             rs.close()
 
     @gen_test
-    def test_read_until_max_bytes_ignores_extra(self: typing.Any):
+    def test_read_until_max_bytes_ignores_extra(self):
         rs, ws = yield self.make_iostream_pair()
         closed = Event()
         rs.set_close_callback(closed.set)
@@ -474,7 +508,7 @@ class TestReadWriteMixin(object):
             rs.close()
 
     @gen_test
-    def test_read_until_regex_max_bytes(self: typing.Any):
+    def test_read_until_regex_max_bytes(self):
         rs, ws = yield self.make_iostream_pair()
         closed = Event()
         rs.set_close_callback(closed.set)
@@ -502,7 +536,7 @@ class TestReadWriteMixin(object):
             rs.close()
 
     @gen_test
-    def test_read_until_regex_max_bytes_inline(self: typing.Any):
+    def test_read_until_regex_max_bytes_inline(self):
         rs, ws = yield self.make_iostream_pair()
         closed = Event()
         rs.set_close_callback(closed.set)
@@ -537,7 +571,7 @@ class TestReadWriteMixin(object):
             rs.close()
 
     @gen_test
-    def test_small_reads_from_large_buffer(self: typing.Any):
+    def test_small_reads_from_large_buffer(self):
         # 10KB buffer size, 100KB available to read.
         # Read 1KB at a time and make sure that the buffer is not eagerly
         # filled.
@@ -552,7 +586,7 @@ class TestReadWriteMixin(object):
             rs.close()
 
     @gen_test
-    def test_small_read_untils_from_large_buffer(self: typing.Any):
+    def test_small_read_untils_from_large_buffer(self):
         # 10KB buffer size, 100KB available to read.
         # Read 1KB at a time and make sure that the buffer is not eagerly
         # filled.
@@ -585,7 +619,7 @@ class TestReadWriteMixin(object):
             ws.close()
 
     @gen_test
-    def test_read_into(self: typing.Any):
+    def test_read_into(self):
         rs, ws = yield self.make_iostream_pair()
 
         def sleep_some():
@@ -627,7 +661,7 @@ class TestReadWriteMixin(object):
             rs.close()
 
     @gen_test
-    def test_read_into_partial(self: typing.Any):
+    def test_read_into_partial(self):
         rs, ws = yield self.make_iostream_pair()
 
         try:
@@ -656,7 +690,120 @@ class TestReadWriteMixin(object):
             rs.close()
 
     @gen_test
-    def test_read_into_zero_bytes(self: typing.Any):
+    def test_read_into_buffer_resizable(self):
+        # The caller must be able to resize their buffer once the read is
+        # complete, which requires that we don't leave any memoryviews of
+        # it alive (on PyPy, views are not freed until garbage collection).
+        rs, ws = yield self.make_iostream_pair()
+        try:
+            # Read directly from the socket into the buffer.
+            buf = bytearray(5)
+            fut = rs.read_into(buf)
+            yield gen.sleep(0.01)
+            ws.write(b"hello")
+            yield fut
+            self.assertEqual(bytes(buf), b"hello")
+            del buf[:]
+
+            # Read from the existing buffer.
+            ws.write(b"worldworld")
+            yield rs.read_bytes(1)
+            buf = bytearray(4)
+            yield rs.read_into(buf)
+            self.assertEqual(bytes(buf), b"orld")
+            del buf[:]
+            buf = bytearray(10)
+            yield rs.read_into(buf, partial=True)
+            self.assertEqual(bytes(buf[:5]), b"world")
+            del buf[:]
+        finally:
+            ws.close()
+            rs.close()
+
+    @gen_test
+    def test_write_bytearray_resizable(self):
+        # Like test_read_into_buffer_resizable, for large writes (which
+        # are buffered without copying).
+        rs, ws = yield self.make_iostream_pair()
+        try:
+            data = bytearray(b"x" * 10000)
+            fut = rs.read_bytes(len(data))
+            yield ws.write(data)
+            self.assertEqual((yield fut), bytes(data))
+            del data[:]
+        finally:
+            ws.close()
+            rs.close()
+
+    @gen_test
+    def test_write_bytearray_resizable_after_close_while_writing(self):
+        # If the stream is closed while a large write is in progress, the
+        # views of the caller's data must be released too.
+        # (TestIOStreamMixin.test_write_bytearray_resizable_after_close
+        # covers a close before the stream has connected.)
+        rs, ws = yield self.make_iostream_pair()
+        try:
+            # Write more than the OS buffers can hold (nobody is reading)
+            # so that the write is still pending when we close.
+            data = bytearray(b"x" * (10 * 1024 * 1024))
+            fut = ws.write(data)
+            self.assertTrue(ws.writing())
+            # Hold a reference to the write buffer so the test doesn't depend
+            # on when it is freed (at once on CPython, at GC on PyPy).
+            write_buffer = ws._write_buffer  # noqa: F841
+            ws.close()
+            with self.assertRaises(StreamClosedError):
+                yield fut
+            del data[:]
+        finally:
+            ws.close()
+            rs.close()
+
+    @gen_test
+    def test_write_bytearray_resizable_after_error(self):
+        # Like test_write_bytearray_resizable_after_close, but the stream
+        # is closed because of a write error (the peer has gone away).
+        rs, ws = yield self.make_iostream_pair()
+        try:
+            rs.close()
+            data = bytearray(b"x" * (10 * 1024 * 1024))
+            write_buffer = ws._write_buffer  # noqa: F841
+            with self.assertRaises(StreamClosedError):
+                # Depending on timing this may fail synchronously or
+                # asynchronously; either way the write must not complete.
+                yield ws.write(data)
+            self.assertTrue(ws.closed())
+            del data[:]
+        finally:
+            ws.close()
+            rs.close()
+
+    @gen_test
+    def test_read_into_resizable_after_close(self):
+        # If the stream is closed while a read_into is pending, the
+        # caller's buffer must be resizable once the read has failed.
+        rs, ws = yield self.make_iostream_pair()
+        try:
+            # Put some data in the stream's own buffer first so both the
+            # copy from the read buffer and the read directly into the
+            # caller's buffer are exercised.
+            ws.write(b"ab")
+            yield rs.read_bytes(1)
+            buf = bytearray(10)
+            fut = rs.read_into(buf)
+            self.assertEqual(bytes(buf[:1]), b"b")
+            ws.write(b"cd")
+            yield gen.sleep(0.01)
+            ws.close()
+            with self.assertRaises(StreamClosedError):
+                yield fut
+            del buf[:]
+        finally:
+            ws.close()
+            rs.close()
+
+    @gen_test
+    def test_read_into_zero_bytes(self):
         rs, ws = yield self.make_iostream_pair()
         try:
             buf = bytearray()
@@ -717,6 +864,7 @@ class TestReadWriteMixin(object):
             rs.close()
 
 
+@abstract_base_test
 class TestIOStreamMixin(TestReadWriteMixin):
     def _make_server_iostream(self, connection, **kwargs):
         raise NotImplementedError()
@@ -725,9 +873,9 @@ class TestIOStreamMixin(TestReadWriteMixin):
         raise NotImplementedError()
 
     @gen.coroutine
-    def make_iostream_pair(self: typing.Any, **kwargs):
+    def make_iostream_pair(self, **kwargs):
         listener, port = bind_unused_port()
-        server_stream_fut = Future()  # type: Future[IOStream]
+        server_stream_fut: Future[IOStream] = Future()
 
         def accept_callback(connection, address):
             server_stream_fut.set_result(
@@ -743,7 +891,7 @@ class TestIOStreamMixin(TestReadWriteMixin):
         raise gen.Return((server_stream, client_stream))
 
     @gen_test
-    def test_connection_refused(self: typing.Any):
+    def test_connection_refused(self):
         # When a connection is refused, the connect callback should not
         # be run.  (The kqueue IOLoop used to behave differently from the
         # epoll IOLoop in this respect)
@@ -757,10 +905,15 @@ class TestIOStreamMixin(TestReadWriteMixin):
             with self.assertRaises(StreamClosedError):
                 yield stream.connect(("127.0.0.1", port))
 
-        self.assertTrue(isinstance(stream.error, ConnectionRefusedError), stream.error)
+        if sys.platform == "win32":
+            # See refusing_port: on Windows the connection fails with a
+            # different error.
+            self.assertIsInstance(stream.error, OSError)
+        else:
+            self.assertIsInstance(stream.error, ConnectionRefusedError)
 
     @gen_test
-    def test_gaierror(self: typing.Any):
+    def test_gaierror(self):
         # Test that IOStream sets its exc_info on getaddrinfo error.
         # It's difficult to reliably trigger a getaddrinfo error;
         # some resolvers own't even return errors for malformed names,
@@ -777,7 +930,7 @@ class TestIOStreamMixin(TestReadWriteMixin):
             self.assertTrue(isinstance(stream.error, socket.gaierror))
 
     @gen_test
-    def test_read_until_close_with_error(self: typing.Any):
+    def test_read_until_close_with_error(self):
         server, client = yield self.make_iostream_pair()
         try:
             with mock.patch(
@@ -790,10 +943,75 @@ class TestIOStreamMixin(TestReadWriteMixin):
             server.close()
             client.close()
 
-    @skipIfNonUnix
-    @skipPypy3V58
     @gen_test
-    def test_inline_read_error(self: typing.Any):
+    def test_read_until_close_after_error_close(self):
+        # If the stream is closed with an error while a read_until_close
+        # is pending, the error must be reported rather than resolving the
+        # read successfully with whatever happened to be buffered. The
+        # caller otherwise cannot distinguish a complete body from one
+        # truncated by a connection error.
+        server, client = yield self.make_iostream_pair()
+        try:
+            fut = client.read_until_close()
+            server.write(b"hello")
+            yield gen.sleep(0.01)
+            client.close(exc_info=IOError("boom"))
+            with self.assertRaises(StreamClosedError) as cm:
+                yield fut
+            self.assertIsInstance(cm.exception.real_error, IOError)
+        finally:
+            server.close()
+            client.close()
+
+    @gen_test
+    def test_read_until_close_after_connection_reset(self):
+        # A connection reset is treated as a normal close throughout
+        # IOStream: on some platforms (notably windows) a peer that closes
+        # cleanly may be reported to us as a reset, so a pending
+        # read_until_close must still return the buffered data instead of
+        # failing.
+        rs, ws = yield self.make_iostream_pair()
+        try:
+            real_read_from_fd = rs.read_from_fd
+
+            def read_from_fd(buf):
+                result = real_read_from_fd(buf)
+                if result == 0:
+                    # Report the EOF as a reset instead.
+                    raise ConnectionResetError(errno.ECONNRESET, "Connection reset")
+                return result
+
+            rs.read_from_fd = read_from_fd
+            ws.write(b"1234")
+            data = yield rs.read_bytes(1)
+            self.assertEqual(data, b"1")
+            ws.close()
+            data = yield rs.read_until_close()
+            self.assertEqual(data, b"234")
+        finally:
+            ws.close()
+            rs.close()
+
+    @gen_test
+    def test_read_until_close_with_buffer_overflow(self):
+        # Overflowing the read buffer during a read_until_close must raise
+        # rather than silently returning a truncated result.
+        server, client = yield self.make_iostream_pair(max_buffer_size=1024)
+        try:
+            fut = client.read_until_close()
+            server.write(b"a" * 4096)
+            with ExpectLog(gen_log, "Reached maximum read buffer size"):
+                with ExpectLog(gen_log, "error on read"):
+                    with self.assertRaises(StreamClosedError) as cm:
+                        yield fut
+            self.assertIsInstance(cm.exception.real_error, StreamBufferFullError)
+        finally:
+            server.close()
+            client.close()
+
+    @skipIfNonUnix
+    @gen_test
+    def test_inline_read_error(self):
         # An error on an inline read is raised without logging (on the
         # assumption that it will eventually be noticed or logged further
         # up the stack).
@@ -811,7 +1029,10 @@ class TestIOStreamMixin(TestReadWriteMixin):
         # windows, making this check redundant with skipIfNonUnix, but
         # we sometimes enable it on other platforms for testing.
         io_loop = IOLoop.current()
-        if isinstance(io_loop.selector_loop, AddThreadSelectorEventLoop):
+        if isinstance(
+            io_loop.selector_loop,  # type: ignore[attr-defined]
+            AddThreadSelectorEventLoop,
+        ):
             self.skipTest("AddThreadSelectorEventLoop not supported")
         server, client = yield self.make_iostream_pair()
         try:
@@ -822,7 +1043,6 @@ class TestIOStreamMixin(TestReadWriteMixin):
             server.close()
             client.close()
 
-    @skipPypy3V58
     @gen_test
     def test_async_read_error_logging(self):
         # Socket errors on asynchronous reads should be logged (but only
@@ -879,18 +1099,44 @@ class TestIOStreamMixin(TestReadWriteMixin):
             server.close()
             client.close()
 
+    @gen_test
+    def test_write_bytearray_resizable_after_close(self):
+        # Like test_write_bytearray_resizable, but the stream is closed
+        # while the data is still in the write buffer (here because the
+        # stream is still connecting).
+        listener, port = bind_unused_port()
+        self.addCleanup(listener.close)
+        stream = self._make_client_iostream(socket.socket())
+        connect_fut = stream.connect(("127.0.0.1", port))
+        data = bytearray(b"x" * 10000)
+        write_fut = stream.write(data)
+        # Hold a reference to the write buffer so the test doesn't depend on
+        # when it is freed (at once on CPython, at garbage collection on PyPy).
+        write_buffer = stream._write_buffer  # noqa: F841
+        stream.close()
+        for fut in [connect_fut, write_fut]:
+            with self.assertRaises(StreamClosedError):
+                yield fut
+        del data[:]
 
-class TestIOStreamWebHTTP(TestIOStreamWebMixin, AsyncHTTPTestCase):
+
+class TestIOStreamWebHTTP(AsyncHTTPTestCase, TestIOStreamWebMixin):
     def _make_client_iostream(self):
         return IOStream(socket.socket())
 
+    def get_app(self):
+        return self.mixin_get_app()
 
-class TestIOStreamWebHTTPS(TestIOStreamWebMixin, AsyncHTTPSTestCase):
+
+class TestIOStreamWebHTTPS(AsyncHTTPSTestCase, TestIOStreamWebMixin):
     def _make_client_iostream(self):
         return SSLIOStream(socket.socket(), ssl_options=dict(cert_reqs=ssl.CERT_NONE))
 
+    def get_app(self):
+        return self.mixin_get_app()
 
-class TestIOStream(TestIOStreamMixin, AsyncTestCase):
+
+class TestIOStream(TestIOStreamMixin):
     def _make_server_iostream(self, connection, **kwargs):
         return IOStream(connection, **kwargs)
 
@@ -898,13 +1144,13 @@ class TestIOStream(TestIOStreamMixin, AsyncTestCase):
         return IOStream(connection, **kwargs)
 
 
-class TestIOStreamSSL(TestIOStreamMixin, AsyncTestCase):
+class TestIOStreamSSL(TestIOStreamMixin):
     def _make_server_iostream(self, connection, **kwargs):
-        connection = ssl.wrap_socket(
+        ssl_ctx = ssl_options_to_context(_server_ssl_options(), server_side=True)
+        connection = ssl_ctx.wrap_socket(
             connection,
             server_side=True,
             do_handshake_on_connect=False,
-            **_server_ssl_options()
         )
         return SSLIOStream(connection, **kwargs)
 
@@ -917,9 +1163,9 @@ class TestIOStreamSSL(TestIOStreamMixin, AsyncTestCase):
 # This will run some tests that are basically redundant but it's the
 # simplest way to make sure that it works to pass an SSLContext
 # instead of an ssl_options dict to the SSLIOStream constructor.
-class TestIOStreamSSLContext(TestIOStreamMixin, AsyncTestCase):
+class TestIOStreamSSLContext(TestIOStreamMixin):
     def _make_server_iostream(self, connection, **kwargs):
-        context = ssl.SSLContext(ssl.PROTOCOL_SSLv23)
+        context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
         context.load_cert_chain(
             os.path.join(os.path.dirname(__file__), "test.crt"),
             os.path.join(os.path.dirname(__file__), "test.key"),
@@ -930,7 +1176,9 @@ class TestIOStreamSSLContext(TestIOStreamMixin, AsyncTestCase):
         return SSLIOStream(connection, **kwargs)
 
     def _make_client_iostream(self, connection, **kwargs):
-        context = ssl.SSLContext(ssl.PROTOCOL_SSLv23)
+        context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
         return SSLIOStream(connection, ssl_options=context, **kwargs)
 
 
@@ -940,11 +1188,9 @@ class TestIOStreamStartTLS(AsyncTestCase):
             super().setUp()
             self.listener, self.port = bind_unused_port()
             self.server_stream = None
-            self.server_accepted = Future()  # type: Future[None]
+            self.server_accepted: Future[None] = Future()
             netutil.add_accept_handler(self.listener, self.accept)
-            self.client_stream = IOStream(
-                socket.socket()
-            )  # type: typing.Optional[IOStream]
+            self.client_stream: IOStream | None = IOStream(socket.socket())
             self.io_loop.add_future(
                 self.client_stream.connect(("127.0.0.1", self.port)), self.stop
             )
@@ -1033,8 +1279,6 @@ class TestIOStreamStartTLS(AsyncTestCase):
     @gen_test
     def test_check_hostname(self):
         # Test that server_hostname parameter to start_tls is being used.
-        # The check_hostname functionality is only available in python 2.7 and
-        # up and in python 3.4 and up.
         server_future = self.server_start_tls(_server_ssl_options())
         with ExpectLog(gen_log, "SSL Error"):
             client_future = self.client_start_tls(
@@ -1046,6 +1290,17 @@ class TestIOStreamStartTLS(AsyncTestCase):
             with self.assertRaises(Exception):
                 # The server fails to connect, but the exact error is unspecified.
                 yield server_future
+
+    @gen_test
+    def test_start_tls_cancellation(self):
+        # The server never responds to the handshake. Cancelling the client's
+        # start_tls future must close the underlying socket (#3614).
+        client_future = self.client_start_tls(dict(cert_reqs=ssl.CERT_NONE))
+        client_future.cancel()
+        self.assertTrue(client_future.cancelled())
+        # read_until_close only completes if the client's socket was closed.
+        assert self.server_stream is not None
+        yield self.server_stream.read_until_close()
 
     @gen_test
     def test_typed_memoryview(self):
@@ -1076,8 +1331,11 @@ class WaitForHandshakeTest(AsyncTestCase):
             # to openssl 1.1.c. Other platforms might be affected with
             # newer openssl too). Disable it until we figure out
             # what's up.
-            ssl_ctx.options |= getattr(ssl, "OP_NO_TLSv1_3", 0)
-            client = SSLIOStream(socket.socket(), ssl_options=ssl_ctx)
+            # Update 2021-12-28: Still happening with Python 3.10 on
+            # Windows. OP_NO_TLSv1_3 now raises a DeprecationWarning.
+            with ignore_deprecation():
+                ssl_ctx.options |= getattr(ssl, "OP_NO_TLSv1_3", 0)
+                client = SSLIOStream(socket.socket(), ssl_options=ssl_ctx)
             yield client.connect(("127.0.0.1", port))
             self.assertIsNotNone(client.socket.cipher())
         finally:
@@ -1089,7 +1347,7 @@ class WaitForHandshakeTest(AsyncTestCase):
     @gen_test
     def test_wait_for_handshake_future(self):
         test = self
-        handshake_future = Future()  # type: Future[None]
+        handshake_future: Future[None] = Future()
 
         class TestServer(TCPServer):
             def handle_stream(self, stream, address):
@@ -1107,7 +1365,7 @@ class WaitForHandshakeTest(AsyncTestCase):
     @gen_test
     def test_wait_for_handshake_already_waiting_error(self):
         test = self
-        handshake_future = Future()  # type: Future[None]
+        handshake_future: Future[None] = Future()
 
         class TestServer(TCPServer):
             @gen.coroutine
@@ -1123,7 +1381,7 @@ class WaitForHandshakeTest(AsyncTestCase):
 
     @gen_test
     def test_wait_for_handshake_already_connected(self):
-        handshake_future = Future()  # type: Future[None]
+        handshake_future: Future[None] = Future()
 
         class TestServer(TCPServer):
             @gen.coroutine
@@ -1134,6 +1392,92 @@ class WaitForHandshakeTest(AsyncTestCase):
 
         yield self.connect_to_server(TestServer)
         yield handshake_future
+
+
+class TestIOStreamCheckHostname(AsyncTestCase):
+    # This test ensures that hostname checks are working correctly after
+    # #3337 revealed that we have no test coverage in this area, and we
+    # removed a manual hostname check that was needed only for very old
+    # versions of python.
+    def setUp(self):
+        super().setUp()
+        self.listener, self.port = bind_unused_port()
+
+        def accept_callback(connection, address):
+            ssl_ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+            ssl_ctx.load_cert_chain(
+                os.path.join(os.path.dirname(__file__), "test.crt"),
+                os.path.join(os.path.dirname(__file__), "test.key"),
+            )
+            connection = ssl_ctx.wrap_socket(
+                connection,
+                server_side=True,
+                do_handshake_on_connect=False,
+            )
+            SSLIOStream(connection)
+
+        netutil.add_accept_handler(self.listener, accept_callback)
+
+        # Our self-signed cert is its own CA.  We have to pass the CA check before
+        # the hostname check will be performed.
+        self.client_ssl_ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
+        self.client_ssl_ctx.load_verify_locations(
+            os.path.join(os.path.dirname(__file__), "test.crt")
+        )
+
+    def tearDown(self):
+        self.io_loop.remove_handler(self.listener.fileno())
+        self.listener.close()
+        super().tearDown()
+
+    @gen_test
+    async def test_match(self):
+        stream = SSLIOStream(socket.socket(), ssl_options=self.client_ssl_ctx)
+        await stream.connect(
+            ("127.0.0.1", self.port),
+            server_hostname="foo.example.com",
+        )
+        stream.close()
+
+    @gen_test
+    async def test_no_match(self):
+        stream = SSLIOStream(socket.socket(), ssl_options=self.client_ssl_ctx)
+        # The exact error strings depend on the TLS implementation: OpenSSL
+        # spells them out in prose while AWS-LC (and BoringSSL) use the
+        # uppercase name of the error reason.
+        with ExpectLog(
+            gen_log,
+            ".*(alert bad certificate|SSLV3_ALERT_BAD_CERTIFICATE)",
+            level=logging.WARNING,
+            required=platform.system() != "Windows",
+        ):
+            with self.assertRaises(ssl.SSLCertVerificationError):
+                with ExpectLog(
+                    gen_log,
+                    ".*(certificate verify failed|CERTIFICATE_VERIFY_FAILED)"
+                    ": Hostname mismatch",
+                    level=logging.WARNING,
+                ):
+                    await stream.connect(
+                        ("127.0.0.1", self.port),
+                        server_hostname="bar.example.com",
+                    )
+            # The server logs a warning while cleaning up the failed connection.
+            # Unfortunately there's no good hook to wait for this logging.
+            # It doesn't seem to happen on windows; I'm not sure why.
+            if platform.system() != "Windows":
+                await asyncio.sleep(0.1)
+
+    @gen_test
+    async def test_check_disabled(self):
+        # check_hostname can be set to false and the connection will succeed even though it doesn't
+        # have the right hostname.
+        self.client_ssl_ctx.check_hostname = False
+        stream = SSLIOStream(socket.socket(), ssl_options=self.client_ssl_ctx)
+        await stream.connect(
+            ("127.0.0.1", self.port),
+            server_hostname="bar.example.com",
+        )
 
 
 @skipIfNonUnix
@@ -1180,7 +1524,7 @@ class TestPipeIOStream(TestReadWriteMixin, AsyncTestCase):
         rs.close()
 
 
-class TestStreamBuffer(unittest.TestCase):
+class TestStreamBuffer(TestCase):
     """
     Unit tests for the private _StreamBuffer class.
     """
@@ -1205,7 +1549,10 @@ class TestStreamBuffer(unittest.TestCase):
     def check_peek(self, buf, expected):
         size = 1
         while size < 2 * len(expected):
-            got = self.to_bytes(buf.peek(size))
+            # peek's contract requires the view to be released before the
+            # buffer is modified.
+            with buf.peek(size) as view:
+                got = self.to_bytes(view)
             self.assertTrue(got)  # Not empty
             self.assertLessEqual(len(got), size)
             self.assertTrue(expected.startswith(got), (expected, got))
@@ -1291,3 +1638,88 @@ class TestStreamBuffer(unittest.TestCase):
         buf.advance(2)
         self.assertEqual(len(buf._buffers), 0)
         self.assertEqual(len(buf), 0)
+
+    def assert_resizable(self, data):
+        # Raises BufferError if any view of ``data`` is still alive.
+        data += b"!"
+        del data[-1:]
+
+    def assert_not_resizable(self, data):
+        with self.assertRaises(BufferError):
+            data += b"!"
+
+    def test_release_large_views(self):
+        # Large bytearrays are buffered by reference. The views must be
+        # released explicitly once they are consumed so the caller can
+        # resize them (on PyPy, views are not freed until garbage
+        # collection).
+        buf = self.make_streambuffer(10)
+        a = bytearray(b"a" * 20)
+        b = bytearray(b"b" * 20)
+        buf.append(a)
+        buf.append(b)
+        self.assert_not_resizable(a)
+        buf.advance(15)
+        self.assert_not_resizable(a)
+        self.check_peek(buf, b"a" * 5 + b"b" * 20)
+        buf.advance(10)
+        self.assert_resizable(a)
+        self.assert_not_resizable(b)
+        buf.advance(15)
+        self.assert_resizable(b)
+        self.assertEqual(len(buf), 0)
+
+    def test_clear(self):
+        buf = self.make_streambuffer(10)
+        large = bytearray(b"x" * 20)
+        buf.append(b"12345")
+        buf.append(large)
+        buf.append(b"67")
+        buf.advance(3)
+        self.assert_not_resizable(large)
+        buf.clear()
+        self.assert_resizable(large)
+        self.assertEqual(len(buf), 0)
+        self.assertEqual(len(buf._buffers), 0)
+        with buf.peek(10) as view:
+            self.assertEqual(len(view), 0)
+        # The buffer is still usable after being cleared.
+        buf.append(b"abc")
+        self.check_peek(buf, b"abc")
+        buf.advance(3)
+        self.assertEqual(len(buf), 0)
+
+    def test_interleaved_random(self):
+        # Interleave appends and advances of random sizes and types
+        # (instead of appending everything up front like the tests above)
+        # and compare against a simple model. Afterwards, none of the
+        # caller's buffers may still be referenced by a view.
+        for threshold in [1, 10, 100]:
+            buf = self.make_streambuffer(threshold)
+            expected = b""
+            inputs = []
+            for i in range(500):
+                if expected and self.random.random() < 0.5:
+                    n = self.random.randrange(1, len(expected) + 1)
+                    buf.advance(n)
+                    expected = expected[n:]
+                else:
+                    data = os.urandom(self.random.randrange(0, 3 * threshold))
+                    typ = self.random.choice([bytes, bytearray, memoryview])
+                    obj = typ(data)
+                    inputs.append(obj)
+                    buf.append(obj)
+                    expected += data
+                self.assertEqual(len(buf), len(expected))
+                if expected:
+                    size = self.random.randrange(1, 2 * len(expected) + 1)
+                    with buf.peek(size) as view:
+                        got = view.tobytes()
+                    self.assertTrue(got)
+                    self.assertTrue(expected.startswith(got))
+            if expected:
+                buf.advance(len(expected))
+            self.assertEqual(len(buf), 0)
+            for obj in inputs:
+                if isinstance(obj, bytearray):
+                    self.assert_resizable(obj)

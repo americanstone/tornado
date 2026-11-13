@@ -2,14 +2,15 @@ import os
 import traceback
 import unittest
 
-from tornado.escape import utf8, native_str, to_unicode
-from tornado.template import Template, DictLoader, ParseError, Loader
+from tornado.escape import native_str, to_unicode, utf8
+from tornado.template import DictLoader, Loader, ParseError, Template
 from tornado.util import ObjectDict
 
-import typing  # noqa: F401
+
+from tornado.test.util import TestCase
 
 
-class TemplateTest(unittest.TestCase):
+class TemplateTest(TestCase):
     def test_simple(self):
         template = Template("Hello {{ name }}!")
         self.assertEqual(template.generate(name="Ben"), b"Hello Ben!")
@@ -78,16 +79,16 @@ class TemplateTest(unittest.TestCase):
         )
 
     def test_unicode_template(self):
-        template = Template(utf8(u"\u00e9"))
-        self.assertEqual(template.generate(), utf8(u"\u00e9"))
+        template = Template(utf8("\u00e9"))
+        self.assertEqual(template.generate(), utf8("\u00e9"))
 
     def test_unicode_literal_expression(self):
         # Unicode literals should be usable in templates.  Note that this
         # test simulates unicode characters appearing directly in the
         # template file (with utf8 encoding), i.e. \u escapes would not
         # be used in the template file itself.
-        template = Template(utf8(u'{{ "\u00e9" }}'))
-        self.assertEqual(template.generate(), utf8(u"\u00e9"))
+        template = Template(utf8('{{ "\u00e9" }}'))
+        self.assertEqual(template.generate(), utf8("\u00e9"))
 
     def test_custom_namespace(self):
         loader = DictLoader(
@@ -106,15 +107,15 @@ class TemplateTest(unittest.TestCase):
         def upper(s):
             return to_unicode(s).upper()
 
-        template = Template(utf8(u"{% apply upper %}foo \u00e9{% end %}"))
-        self.assertEqual(template.generate(upper=upper), utf8(u"FOO \u00c9"))
+        template = Template(utf8("{% apply upper %}foo \u00e9{% end %}"))
+        self.assertEqual(template.generate(upper=upper), utf8("FOO \u00c9"))
 
     def test_bytes_apply(self):
         def upper(s):
             return utf8(to_unicode(s).upper())
 
-        template = Template(utf8(u"{% apply upper %}foo \u00e9{% end %}"))
-        self.assertEqual(template.generate(upper=upper), utf8(u"FOO \u00c9"))
+        template = Template(utf8("{% apply upper %}foo \u00e9{% end %}"))
+        self.assertEqual(template.generate(upper=upper), utf8("FOO \u00c9"))
 
     def test_if(self):
         template = Template(utf8("{% if x > 4 %}yes{% else %}no{% end %}"))
@@ -126,16 +127,12 @@ class TemplateTest(unittest.TestCase):
         self.assertEqual(template.generate(), b"")
 
     def test_try(self):
-        template = Template(
-            utf8(
-                """{% try %}
+        template = Template(utf8("""{% try %}
 try{% set y = 1/x %}
 {% except %}-except
 {% else %}-else
 {% finally %}-finally
-{% end %}"""
-            )
-        )
+{% end %}"""))
         self.assertEqual(template.generate(x=1), b"\ntry\n-else\n-finally\n")
         self.assertEqual(template.generate(x=0), b"\ntry-except\n-finally\n")
 
@@ -144,9 +141,7 @@ try{% set y = 1/x %}
         self.assertEqual(template.generate(), b"foo")
 
     def test_break_continue(self):
-        template = Template(
-            utf8(
-                """\
+        template = Template(utf8("""\
 {% for i in range(10) %}
     {% if i == 2 %}
         {% continue %}
@@ -155,31 +150,23 @@ try{% set y = 1/x %}
     {% if i == 6 %}
         {% break %}
     {% end %}
-{% end %}"""
-            )
-        )
+{% end %}"""))
         result = template.generate()
         # remove extraneous whitespace
         result = b"".join(result.split())
         self.assertEqual(result, b"013456")
 
     def test_break_outside_loop(self):
-        try:
+        with self.assertRaises(ParseError, msg="Did not get expected exception"):
             Template(utf8("{% break %}"))
-            raise Exception("Did not get expected exception")
-        except ParseError:
-            pass
 
     def test_break_in_apply(self):
         # This test verifies current behavior, although of course it would
         # be nice if apply didn't cause seemingly unrelated breakage
-        try:
+        with self.assertRaises(ParseError, msg="Did not get expected exception"):
             Template(
                 utf8("{% for i in [] %}{% apply foo %}{% break %}{% end %}{% end %}")
             )
-            raise Exception("Did not get expected exception")
-        except ParseError:
-            pass
 
     @unittest.skip("no testable future imports")
     def test_no_inherit_future(self):
@@ -194,20 +181,16 @@ try{% set y = 1/x %}
         self.assertEqual(template.generate(), "0")
 
     def test_non_ascii_name(self):
-        loader = DictLoader({u"t\u00e9st.html": "hello"})
-        self.assertEqual(loader.load(u"t\u00e9st.html").generate(), b"hello")
+        loader = DictLoader({"t\u00e9st.html": "hello"})
+        self.assertEqual(loader.load("t\u00e9st.html").generate(), b"hello")
 
 
-class StackTraceTest(unittest.TestCase):
+class StackTraceTest(TestCase):
     def test_error_line_number_expression(self):
-        loader = DictLoader(
-            {
-                "test.html": """one
+        loader = DictLoader({"test.html": """one
 two{{1/0}}
 three
-        """
-            }
-        )
+        """})
         try:
             loader.load("test.html").generate()
             self.fail("did not get expected exception")
@@ -215,14 +198,10 @@ three
             self.assertTrue("# test.html:2" in traceback.format_exc())
 
     def test_error_line_number_directive(self):
-        loader = DictLoader(
-            {
-                "test.html": """one
+        loader = DictLoader({"test.html": """one
 two{%if 1/0%}
 three{%end%}
-        """
-            }
-        )
+        """})
         try:
             loader.load("test.html").generate()
             self.fail("did not get expected exception")
@@ -230,7 +209,7 @@ three{%end%}
             self.assertTrue("# test.html:2" in traceback.format_exc())
 
     def test_error_line_number_module(self):
-        loader = None  # type: typing.Optional[DictLoader]
+        loader: DictLoader | None = None
 
         def load_generate(path, **kwargs):
             assert loader is not None
@@ -267,7 +246,7 @@ three{%end%}
             self.fail("did not get expected exception")
         except ZeroDivisionError:
             exc_stack = traceback.format_exc()
-        self.assertTrue("# base.html:1" in exc_stack)
+        self.assertIn("# base.html:1", exc_stack)
 
     def test_error_line_number_extends_sub_error(self):
         loader = DictLoader(
@@ -285,7 +264,7 @@ three{%end%}
             loader.load("sub.html").generate()
             self.fail("did not get expected exception")
         except ZeroDivisionError:
-            self.assertTrue("# sub.html:4 (via base.html:1)" in traceback.format_exc())
+            self.assertIn("# sub.html:4 (via base.html:1)", traceback.format_exc())
 
     def test_multi_includes(self):
         loader = DictLoader(
@@ -299,12 +278,10 @@ three{%end%}
             loader.load("a.html").generate()
             self.fail("did not get expected exception")
         except ZeroDivisionError:
-            self.assertTrue(
-                "# c.html:1 (via b.html:1, a.html:1)" in traceback.format_exc()
-            )
+            self.assertIn("# c.html:1 (via b.html:1, a.html:1)", traceback.format_exc())
 
 
-class ParseErrorDetailTest(unittest.TestCase):
+class ParseErrorDetailTest(TestCase):
     def test_details(self):
         loader = DictLoader({"foo.html": "\n\n{{"})
         with self.assertRaises(ParseError) as cm:
@@ -319,7 +296,7 @@ class ParseErrorDetailTest(unittest.TestCase):
         self.assertEqual("asdf at None:0", str(ParseError("asdf")))
 
 
-class AutoEscapeTest(unittest.TestCase):
+class AutoEscapeTest(TestCase):
     def setUp(self):
         self.templates = {
             "escaped.html": "{% autoescape xhtml_escape %}{{ name }}",
@@ -457,16 +434,12 @@ raw: {% raw name %}""",
         # Whitespace including newlines is allowed within template tags
         # and directives, and this is one way to avoid long lines while
         # keeping extra whitespace out of the rendered output.
-        loader = DictLoader(
-            {
-                "foo.txt": """\
+        loader = DictLoader({"foo.txt": """\
 {% for i in items
   %}{% if i > 0 %}, {% end %}{#
   #}{{i
   }}{% end
-%}"""
-            }
-        )
+%}"""})
         self.assertEqual(
             loader.load("foo.txt").generate(items=range(5)), b"0, 1, 2, 3, 4"
         )
@@ -509,28 +482,24 @@ raw: {% raw name %}""",
         self.assertEqual(loader.load("bar.txt").generate(), b" bar ")
 
     def test_whitespace_directive(self):
-        loader = DictLoader(
-            {
-                "foo.html": """\
+        loader = DictLoader({"foo.html": """\
 {% whitespace oneline %}
     {% for i in range(3) %}
         {{ i }}
     {% end %}
 {% whitespace all %}
     pre\tformatted
-"""
-            }
-        )
+"""})
         self.assertEqual(
             loader.load("foo.html").generate(), b"  0  1  2  \n    pre\tformatted\n"
         )
 
 
-class TemplateLoaderTest(unittest.TestCase):
+class TemplateLoaderTest(TestCase):
     def setUp(self):
         self.loader = Loader(os.path.join(os.path.dirname(__file__), "templates"))
 
     def test_utf8_in_file(self):
         tmpl = self.loader.load("utf8.html")
         result = tmpl.generate()
-        self.assertEqual(to_unicode(result).strip(), u"H\u00e9llo")
+        self.assertEqual(to_unicode(result).strip(), "H\u00e9llo")

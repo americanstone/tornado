@@ -15,17 +15,13 @@
 # under the License.
 
 import aiopg
+import asyncio
 import bcrypt
 import markdown
 import os.path
 import psycopg2
 import re
-import tornado.escape
-import tornado.httpserver
-import tornado.ioloop
-import tornado.locks
-import tornado.options
-import tornado.web
+import tornado
 import unicodedata
 
 from tornado.options import define, options
@@ -38,19 +34,33 @@ define("db_user", default="blog", help="blog database user")
 define("db_password", default="blog", help="blog database password")
 
 
+def is_local_url(url):
+    r"""Returns True if ``url`` is a path on this site (not a different host).
+
+    Browsers ignore tabs and newlines and treat backslashes like slashes, so
+    "/\evil.com" and "/\t/evil.com" both mean "//evil.com", which is another
+    host. Redirecting to a URL that fails this check could be an open redirect
+    vulnerability (https://cwe.mitre.org/data/definitions/601.html).
+    """
+    url = url.strip("".join(chr(i) for i in range(0x21)))
+    url = url.replace("\t", "").replace("\n", "").replace("\r", "")
+    url = url.replace("\\", "/")
+    return url.startswith("/") and not url.startswith("//")
+
+
 class NoResultError(Exception):
     pass
 
 
 async def maybe_create_tables(db):
     try:
-        with (await db.cursor()) as cur:
+        with await db.cursor() as cur:
             await cur.execute("SELECT COUNT(*) FROM entries LIMIT 1")
             await cur.fetchone()
     except psycopg2.ProgrammingError:
         with open("schema.sql") as f:
             schema = f.read()
-        with (await db.cursor()) as cur:
+        with await db.cursor() as cur:
             await cur.execute(schema)
 
 
@@ -93,7 +103,7 @@ class BaseHandler(tornado.web.RequestHandler):
 
         Must be called with ``await self.execute(...)``
         """
-        with (await self.application.db.cursor()) as cur:
+        with await self.application.db.cursor() as cur:
             await cur.execute(stmt, args)
 
     async def query(self, stmt, *args):
@@ -107,7 +117,7 @@ class BaseHandler(tornado.web.RequestHandler):
 
             for row in await self.query(...)
         """
-        with (await self.application.db.cursor()) as cur:
+        with await self.application.db.cursor() as cur:
             await cur.execute(stmt, args)
             return [self.row_to_obj(row, cur) for row in await cur.fetchall()]
 
@@ -127,7 +137,7 @@ class BaseHandler(tornado.web.RequestHandler):
     async def prepare(self):
         # get_current_user cannot be a coroutine, so set
         # self.current_user in prepare instead.
-        user_id = self.get_secure_cookie("blogdemo_user")
+        user_id = self.get_signed_cookie("blogdemo_user")
         if user_id:
             self.current_user = await self.queryone(
                 "SELECT * FROM authors WHERE id = %s", int(user_id)
@@ -135,6 +145,12 @@ class BaseHandler(tornado.web.RequestHandler):
 
     async def any_author_exists(self):
         return bool(await self.query("SELECT * FROM authors LIMIT 1"))
+
+    def redirect_to_next(self):
+        next = self.get_argument("next", "/")
+        if not is_local_url(next):
+            raise tornado.web.HTTPError(400)
+        self.redirect(next)
 
 
 class HomeHandler(BaseHandler):
@@ -246,8 +262,8 @@ class AuthCreateHandler(BaseHandler):
             self.get_argument("name"),
             tornado.escape.to_unicode(hashed_password),
         )
-        self.set_secure_cookie("blogdemo_user", str(author.id))
-        self.redirect(self.get_argument("next", "/"))
+        self.set_signed_cookie("blogdemo_user", str(author.id))
+        self.redirect_to_next()
 
 
 class AuthLoginHandler(BaseHandler):
@@ -273,8 +289,8 @@ class AuthLoginHandler(BaseHandler):
             tornado.escape.utf8(author.hashed_password),
         )
         if password_equal:
-            self.set_secure_cookie("blogdemo_user", str(author.id))
-            self.redirect(self.get_argument("next", "/"))
+            self.set_signed_cookie("blogdemo_user", str(author.id))
+            self.redirect_to_next()
         else:
             self.render("login.html", error="incorrect password")
 
@@ -282,7 +298,7 @@ class AuthLoginHandler(BaseHandler):
 class AuthLogoutHandler(BaseHandler):
     def get(self):
         self.clear_cookie("blogdemo_user")
-        self.redirect(self.get_argument("next", "/"))
+        self.redirect_to_next()
 
 
 class EntryModule(tornado.web.UIModule):
@@ -313,4 +329,4 @@ async def main():
 
 
 if __name__ == "__main__":
-    tornado.ioloop.IOLoop.current().run_sync(main)
+    asyncio.run(main())

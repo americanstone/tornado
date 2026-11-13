@@ -1,26 +1,3 @@
-from tornado.escape import _unicode
-from tornado import gen, version
-from tornado.httpclient import (
-    HTTPResponse,
-    HTTPError,
-    AsyncHTTPClient,
-    main,
-    _RequestProxy,
-    HTTPRequest,
-)
-from tornado import httputil
-from tornado.http1connection import HTTP1Connection, HTTP1ConnectionParameters
-from tornado.ioloop import IOLoop
-from tornado.iostream import StreamClosedError, IOStream
-from tornado.netutil import (
-    Resolver,
-    OverrideResolver,
-    _client_ssl_defaults,
-    is_valid_ip,
-)
-from tornado.log import gen_log
-from tornado.tcpclient import TCPClient
-
 import base64
 import collections
 import copy
@@ -30,15 +7,39 @@ import socket
 import ssl
 import sys
 import time
-from io import BytesIO
 import urllib.parse
-
-from typing import Dict, Any, Callable, Optional, Type, Union
+from collections.abc import Awaitable, Callable
+from io import BytesIO
 from types import TracebackType
-import typing
+from typing import Any, Optional, Type, cast
 
-if typing.TYPE_CHECKING:
-    from typing import Deque, Tuple, List  # noqa: F401
+from tornado import gen, httputil, version
+from tornado.escape import _unicode
+from tornado.http1connection import HTTP1Connection, HTTP1ConnectionParameters
+from tornado.httpclient import (
+    AsyncHTTPClient,
+    HTTPError,
+    HTTPRequest,
+    HTTPResponse,
+    _RequestProxy,
+    main,
+)
+from tornado.ioloop import IOLoop
+from tornado.iostream import IOStream, StreamClosedError
+from tornado.log import gen_log
+from tornado.netutil import (
+    OverrideResolver,
+    Resolver,
+    _client_ssl_defaults,
+    _client_ssl_noverify,
+    is_valid_ip,
+)
+from tornado.tcpclient import TCPClient
+
+# Control characters and spaces are not allowed anywhere in a URL. urlsplit
+# silently removes some of them (tabs and newlines), and the rest would be sent
+# as-is, producing a malformed request line.
+_FORBIDDEN_URL_CHARS_RE = re.compile(r"[\x00-\x20\x7f]")
 
 
 class HTTPTimeoutError(HTTPError):
@@ -84,61 +85,58 @@ class SimpleAsyncHTTPClient(AsyncHTTPClient):
     supported.  In particular, proxies are not supported, connections
     are not reused, and callers cannot select the network interface to be
     used.
+
+    This implementation supports the following arguments, which can be passed
+    to ``configure()`` to control the global singleton, or to the constructor
+    when ``force_instance=True``.
+
+    ``max_clients`` is the number of concurrent requests that can be
+    in progress; when this limit is reached additional requests will be
+    queued. Note that time spent waiting in this queue still counts
+    against the ``request_timeout``.
+
+    ``defaults`` is a dict of parameters that will be used as defaults on all
+    `.HTTPRequest` objects submitted to this client.
+
+    ``hostname_mapping`` is a dictionary mapping hostnames to IP addresses.
+    It can be used to make local DNS changes when modifying system-wide
+    settings like ``/etc/hosts`` is not possible or desirable (e.g. in
+    unittests). ``resolver`` is similar, but using the `.Resolver` interface
+    instead of a simple mapping.
+
+    ``max_buffer_size`` (default 100MB) is the number of bytes
+    that can be read into memory at once. ``max_body_size``
+    (defaults to ``max_buffer_size``) is the largest response body
+    that the client will accept.  Without a
+    ``streaming_callback``, the smaller of these two limits
+    applies; with a ``streaming_callback`` only ``max_body_size``
+    does.
+
+    .. versionchanged:: 4.2
+        Added the ``max_body_size`` argument.
     """
 
     def initialize(  # type: ignore
         self,
         max_clients: int = 10,
-        hostname_mapping: Optional[Dict[str, str]] = None,
+        hostname_mapping: dict[str, str] | None = None,
         max_buffer_size: int = 104857600,
-        resolver: Optional[Resolver] = None,
-        defaults: Optional[Dict[str, Any]] = None,
-        max_header_size: Optional[int] = None,
-        max_body_size: Optional[int] = None,
+        resolver: Resolver | None = None,
+        defaults: dict[str, Any] | None = None,
+        max_header_size: int | None = None,
+        max_body_size: int | None = None,
     ) -> None:
-        """Creates a AsyncHTTPClient.
-
-        Only a single AsyncHTTPClient instance exists per IOLoop
-        in order to provide limitations on the number of pending connections.
-        ``force_instance=True`` may be used to suppress this behavior.
-
-        Note that because of this implicit reuse, unless ``force_instance``
-        is used, only the first call to the constructor actually uses
-        its arguments. It is recommended to use the ``configure`` method
-        instead of the constructor to ensure that arguments take effect.
-
-        ``max_clients`` is the number of concurrent requests that can be
-        in progress; when this limit is reached additional requests will be
-        queued. Note that time spent waiting in this queue still counts
-        against the ``request_timeout``.
-
-        ``hostname_mapping`` is a dictionary mapping hostnames to IP addresses.
-        It can be used to make local DNS changes when modifying system-wide
-        settings like ``/etc/hosts`` is not possible or desirable (e.g. in
-        unittests).
-
-        ``max_buffer_size`` (default 100MB) is the number of bytes
-        that can be read into memory at once. ``max_body_size``
-        (defaults to ``max_buffer_size``) is the largest response body
-        that the client will accept.  Without a
-        ``streaming_callback``, the smaller of these two limits
-        applies; with a ``streaming_callback`` only ``max_body_size``
-        does.
-
-        .. versionchanged:: 4.2
-           Added the ``max_body_size`` argument.
-        """
         super().initialize(defaults=defaults)
         self.max_clients = max_clients
-        self.queue = (
-            collections.deque()
-        )  # type: Deque[Tuple[object, HTTPRequest, Callable[[HTTPResponse], None]]]
-        self.active = (
-            {}
-        )  # type: Dict[object, Tuple[HTTPRequest, Callable[[HTTPResponse], None]]]
-        self.waiting = (
-            {}
-        )  # type: Dict[object, Tuple[HTTPRequest, Callable[[HTTPResponse], None], object]]
+        self.queue: collections.deque[
+            tuple[object, HTTPRequest, Callable[[HTTPResponse], None]]
+        ] = collections.deque()
+        self.active: dict[
+            object, tuple[HTTPRequest, Callable[[HTTPResponse], None]]
+        ] = {}
+        self.waiting: dict[
+            object, tuple[HTTPRequest, Callable[[HTTPResponse], None], object]
+        ] = {}
         self.max_buffer_size = max_buffer_size
         self.max_header_size = max_header_size
         self.max_body_size = max_body_size
@@ -230,7 +228,7 @@ class SimpleAsyncHTTPClient(AsyncHTTPClient):
                 self.io_loop.remove_timeout(timeout_handle)
             del self.waiting[key]
 
-    def _on_timeout(self, key: object, info: Optional[str] = None) -> None:
+    def _on_timeout(self, key: object, info: str | None = None) -> None:
         """Timeout callback of request.
 
         Construct a timeout HTTPResponse when a timeout occurs.
@@ -241,7 +239,7 @@ class SimpleAsyncHTTPClient(AsyncHTTPClient):
         request, callback, timeout_handle = self.waiting[key]
         self.queue.remove((key, request, callback))
 
-        error_message = "Timeout {0}".format(info) if info else "Timeout"
+        error_message = f"Timeout {info}" if info else "Timeout"
         timeout_response = HTTPResponse(
             request,
             599,
@@ -253,13 +251,11 @@ class SimpleAsyncHTTPClient(AsyncHTTPClient):
 
 
 class _HTTPConnection(httputil.HTTPMessageDelegate):
-    _SUPPORTED_METHODS = set(
-        ["GET", "HEAD", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"]
-    )
+    _SUPPORTED_METHODS = {"GET", "HEAD", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"}
 
     def __init__(
         self,
-        client: Optional[SimpleAsyncHTTPClient],
+        client: SimpleAsyncHTTPClient | None,
         request: HTTPRequest,
         release_callback: Callable[[], None],
         final_callback: Callable[[HTTPResponse], None],
@@ -279,12 +275,12 @@ class _HTTPConnection(httputil.HTTPMessageDelegate):
         self.tcp_client = tcp_client
         self.max_header_size = max_header_size
         self.max_body_size = max_body_size
-        self.code = None  # type: Optional[int]
-        self.headers = None  # type: Optional[httputil.HTTPHeaders]
-        self.chunks = []  # type: List[bytes]
+        self.code: int | None = None
+        self.headers: httputil.HTTPHeaders | None = None
+        self.chunks = bytearray()
         self._decompressor = None
         # Timeout handle returned by IOLoop.add_timeout
-        self._timeout = None  # type: object
+        self._timeout: object = None
         self._sockaddr = None
         IOLoop.current().add_future(
             gen.convert_yielded(self.run()), lambda f: f.result()
@@ -292,7 +288,14 @@ class _HTTPConnection(httputil.HTTPMessageDelegate):
 
     async def run(self) -> None:
         try:
-            self.parsed = urllib.parse.urlsplit(_unicode(self.request.url))
+            url = _unicode(self.request.url)
+            if _FORBIDDEN_URL_CHARS_RE.search(url):
+                raise ValueError("Invalid character in url: %r" % url)
+            # Convert a non-ASCII hostname with IDNA here, so the resolver, the
+            # Host header, and TLS (SNI and certificate checks) all see the same
+            # ASCII name, and percent-encode the rest of the URL.
+            url = httputil._url_to_ascii(url)
+            self.parsed = urllib.parse.urlsplit(url)
             if self.parsed.scheme not in ("http", "https"):
                 raise ValueError("Unsupported url scheme: %s" % self.request.url)
             # urlsplit results have hostname and port results, but they
@@ -335,19 +338,24 @@ class _HTTPConnection(httputil.HTTPMessageDelegate):
                 timeout = self.request.request_timeout
             else:
                 timeout = 0
-            if timeout:
-                self._timeout = self.io_loop.add_timeout(
-                    self.start_time + timeout,
-                    functools.partial(self._on_timeout, "while connecting"),
+            try:
+                stream = await self.tcp_client.connect(
+                    host,
+                    port,
+                    af=af,
+                    ssl_options=ssl_options,
+                    max_buffer_size=self.max_buffer_size,
+                    source_ip=source_ip,
+                    timeout=(
+                        self.start_time + timeout - self.io_loop.time()
+                        if timeout
+                        else None
+                    ),
                 )
-            stream = await self.tcp_client.connect(
-                host,
-                port,
-                af=af,
-                ssl_options=ssl_options,
-                max_buffer_size=self.max_buffer_size,
-                source_ip=source_ip,
-            )
+            except TimeoutError as e:
+                # TCPClient's timeout messages describe which phase of
+                # the connection timed out (DNS, TCP, or TLS).
+                raise HTTPTimeoutError(str(e) or "Timeout while connecting") from None
 
             if self.final_callback is None:
                 # final_callback is cleared if we've hit our timeout.
@@ -388,14 +396,17 @@ class _HTTPConnection(httputil.HTTPMessageDelegate):
                     self.request.headers["Host"] = self.parsed.netloc
             username, password = None, None
             if self.parsed.username is not None:
-                username, password = self.parsed.username, self.parsed.password
+                username = self.parsed.username
+                password = self.parsed.password or ""
             elif self.request.auth_username is not None:
                 username = self.request.auth_username
                 password = self.request.auth_password or ""
             if username is not None:
                 assert password is not None
                 if self.request.auth_mode not in (None, "basic"):
-                    raise ValueError("unsupported auth_mode %s", self.request.auth_mode)
+                    raise ValueError(
+                        "unsupported auth_mode %s" % self.request.auth_mode
+                    )
                 self.request.headers["Authorization"] = "Basic " + _unicode(
                     base64.b64encode(
                         httputil.encode_username_password(username, password)
@@ -404,7 +415,7 @@ class _HTTPConnection(httputil.HTTPMessageDelegate):
             if self.request.user_agent:
                 self.request.headers["User-Agent"] = self.request.user_agent
             elif self.request.headers.get("User-Agent") is None:
-                self.request.headers["User-Agent"] = "Tornado/{}".format(version)
+                self.request.headers["User-Agent"] = f"Tornado/{version}"
             if not self.request.allow_nonstandard_methods:
                 # Some HTTP methods nearly always have bodies while others
                 # almost never do. Fail in this case unless the user has
@@ -432,9 +443,9 @@ class _HTTPConnection(httputil.HTTPMessageDelegate):
                 self.request.method == "POST"
                 and "Content-Type" not in self.request.headers
             ):
-                self.request.headers[
-                    "Content-Type"
-                ] = "application/x-www-form-urlencoded"
+                self.request.headers["Content-Type"] = (
+                    "application/x-www-form-urlencoded"
+                )
             if self.request.decompress_response:
                 self.request.headers["Accept-Encoding"] = "gzip"
             req_path = (self.parsed.path or "/") + (
@@ -451,9 +462,7 @@ class _HTTPConnection(httputil.HTTPMessageDelegate):
             if not self._handle_exception(*sys.exc_info()):
                 raise
 
-    def _get_ssl_options(
-        self, scheme: str
-    ) -> Union[None, Dict[str, Any], ssl.SSLContext]:
+    def _get_ssl_options(self, scheme: str) -> None | dict[str, Any] | ssl.SSLContext:
         if scheme == "https":
             if self.request.ssl_options is not None:
                 return self.request.ssl_options
@@ -465,7 +474,14 @@ class _HTTPConnection(httputil.HTTPMessageDelegate):
                 and self.request.client_cert is None
                 and self.request.client_key is None
             ):
-                return _client_ssl_defaults
+                return _client_ssl_defaults()
+            if (
+                not self.request.validate_cert
+                and self.request.client_cert is None
+                and self.request.client_key is None
+            ):
+                # ca_certs is irrelevant when we're not validating.
+                return _client_ssl_noverify()
             ssl_ctx = ssl.create_default_context(
                 ssl.Purpose.SERVER_AUTH, cafile=self.request.ca_certs
             )
@@ -482,7 +498,7 @@ class _HTTPConnection(httputil.HTTPMessageDelegate):
             return ssl_ctx
         return None
 
-    def _on_timeout(self, info: Optional[str] = None) -> None:
+    def _on_timeout(self, info: str | None = None) -> None:
         """Timeout callback of _HTTPConnection instance.
 
         Raise a `HTTPTimeoutError` when a timeout occurs.
@@ -490,7 +506,7 @@ class _HTTPConnection(httputil.HTTPMessageDelegate):
         :info string key: More detailed timeout information.
         """
         self._timeout = None
-        error_message = "Timeout {0}".format(info) if info else "Timeout"
+        error_message = f"Timeout {info}" if info else "Timeout"
         if self.final_callback is not None:
             self._handle_exception(
                 HTTPTimeoutError, HTTPTimeoutError(error_message), None
@@ -547,10 +563,10 @@ class _HTTPConnection(httputil.HTTPMessageDelegate):
     def _handle_exception(
         self,
         typ: "Optional[Type[BaseException]]",
-        value: Optional[BaseException],
-        tb: Optional[TracebackType],
+        value: BaseException | None,
+        tb: TracebackType | None,
     ) -> bool:
-        if self.final_callback:
+        if self.final_callback is not None:
             self._remove_timeout()
             if isinstance(value, StreamClosedError):
                 if value.real_error is None:
@@ -582,17 +598,21 @@ class _HTTPConnection(httputil.HTTPMessageDelegate):
 
     def on_connection_close(self) -> None:
         if self.final_callback is not None:
-            message = "Connection closed"
             if self.stream.error:
-                raise self.stream.error
+                # This is called from the connection's read loop, which
+                # only logs exceptions, so the error must go to
+                # _handle_exception instead of being raised.
+                error = self.stream.error
+                self._handle_exception(type(error), error, error.__traceback__)
+                return
             try:
-                raise HTTPStreamClosedError(message)
+                raise HTTPStreamClosedError("Connection closed")
             except HTTPStreamClosedError:
                 self._handle_exception(*sys.exc_info())
 
     async def headers_received(
         self,
-        first_line: Union[httputil.ResponseStartLine, httputil.RequestStartLine],
+        first_line: httputil.ResponseStartLine | httputil.RequestStartLine,
         headers: httputil.HTTPHeaders,
     ) -> None:
         assert isinstance(first_line, httputil.ResponseStartLine)
@@ -610,7 +630,7 @@ class _HTTPConnection(httputil.HTTPMessageDelegate):
             # Reassemble the start line.
             self.request.header_callback("%s %s %s\r\n" % first_line)
             for k, v in self.headers.get_all():
-                self.request.header_callback("%s: %s\r\n" % (k, v))
+                self.request.header_callback(f"{k}: {v}\r\n")
             self.request.header_callback("\r\n")
 
     def _should_follow_redirect(self) -> bool:
@@ -626,16 +646,73 @@ class _HTTPConnection(httputil.HTTPMessageDelegate):
 
     def finish(self) -> None:
         assert self.code is not None
-        data = b"".join(self.chunks)
+        data = bytes(self.chunks)
         self._remove_timeout()
         original_request = getattr(self.request, "original_request", self.request)
         if self._should_follow_redirect():
             assert isinstance(self.request, _RequestProxy)
             assert self.headers is not None
             new_request = copy.copy(self.request.request)
-            new_request.url = urllib.parse.urljoin(
-                self.request.url, self.headers["Location"]
+            # Header values are decoded as latin1; recover the original bytes.
+            # Like browsers, interpret them as UTF-8 and reject the redirect
+            # if they are not. Spaces are encoded rather than rejected, as
+            # browsers and curl do for redirects. The result is converted to
+            # an ASCII URL (with an IDNA hostname) as in run().
+            try:
+                location = (
+                    self.headers["Location"]
+                    .encode("latin1")
+                    .decode("utf-8")
+                    .replace(" ", "%20")
+                )
+                new_request.url = httputil._url_to_ascii(
+                    urllib.parse.urljoin(self.request.url, location)
+                )
+            except ValueError as e:
+                # Includes UnicodeDecodeError and invalid IDN hostnames.
+                self._handle_exception(type(e), e, e.__traceback__)
+                return
+            new_request.headers = self.request.headers.copy()
+            # Compare the ASCII forms, so that an IDN hostname written in
+            # Unicode in one URL and with IDNA in the other is the same host.
+            # The original URL was already converted successfully in run().
+            parsed_orig_url = urllib.parse.urlsplit(
+                httputil._url_to_ascii(original_request.url)
             )
+            parsed_new_url = urllib.parse.urlsplit(new_request.url)
+            if (
+                parsed_orig_url.scheme != parsed_new_url.scheme
+                or parsed_orig_url.netloc != parsed_new_url.netloc
+            ):
+                # Cross-origin redirect: strip auth headers.
+                # Note that while there is no formal specification of headers that should be
+                # stripped here, libcurl strips the Authorization and Cookie headers, so we
+                # do the same.
+                # Reference:
+                # https://github.com/curl/curl/blob/01d8191b25a05e8fa91553a6c0d48acb99907d26/lib/http.c#L1827-L1828
+                #
+                # Note that checking for cross-origin redirects is a crude heuristic. It is both
+                # too weak (e.g. cookies that have a path attribute may need to be stripped even on
+                # same-origin redirects) and too strong (e.g. cookies may be kept on cross-host
+                # redirects within the same domain). However, we cannot know the full details of
+                # the cookie policy at this layer, so we use the same heuristic as libcurl.
+                # Applications that need more control over behavior on redirects can set
+                # follow_redirects=False and handle 3xx responses themselves.
+                new_request.auth_username = None
+                new_request.auth_password = None
+                if "@" in parsed_new_url.netloc:
+                    if parsed_new_url.port is not None:
+                        new_netloc = f"{parsed_new_url.hostname}:{parsed_new_url.port}"
+                    else:
+                        assert parsed_new_url.hostname is not None
+                        new_netloc = parsed_new_url.hostname
+                    parsed_new_url = parsed_new_url._replace(netloc=new_netloc)
+                new_request.url = urllib.parse.urlunsplit(parsed_new_url)
+                for h in ["Authorization", "Cookie"]:
+                    try:
+                        del new_request.headers[h]
+                    except KeyError:
+                        pass
             assert self.request.max_redirects is not None
             new_request.max_redirects = self.request.max_redirects - 1
             del new_request.headers["Host"]
@@ -660,16 +737,17 @@ class _HTTPConnection(httputil.HTTPMessageDelegate):
                     "Transfer-Encoding",
                 ]:
                     try:
-                        del self.request.headers[h]
+                        del new_request.headers[h]
                     except KeyError:
                         pass
             new_request.original_request = original_request  # type: ignore
+            assert self.final_callback is not None
             final_callback = self.final_callback
             self.final_callback = None  # type: ignore
             self._release()
             assert self.client is not None
-            fut = self.client.fetch(new_request, raise_error=False)
-            fut.add_done_callback(lambda f: final_callback(f.result()))
+            request_proxy = _RequestProxy(new_request, self.client.defaults)
+            self.client.fetch_impl(cast(HTTPRequest, request_proxy), final_callback)
             self._on_end_request()
             return
         if self.request.streaming_callback:
@@ -692,14 +770,15 @@ class _HTTPConnection(httputil.HTTPMessageDelegate):
     def _on_end_request(self) -> None:
         self.stream.close()
 
-    def data_received(self, chunk: bytes) -> None:
+    def data_received(self, chunk: bytes) -> Awaitable[None] | None:
         if self._should_follow_redirect():
             # We're going to follow a redirect so just discard the body.
-            return
+            return None
         if self.request.streaming_callback is not None:
-            self.request.streaming_callback(chunk)
+            return self.request.streaming_callback(chunk)
         else:
-            self.chunks.append(chunk)
+            self.chunks += chunk
+            return None
 
 
 if __name__ == "__main__":

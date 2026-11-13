@@ -3,10 +3,9 @@ Authentication and security
 
 .. testsetup::
 
-   import tornado.auth
-   import tornado.web
+   import tornado
 
-Cookies and secure cookies
+Cookies and signed cookies
 ~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 You can set cookies in the user's browser with the ``set_cookie``
@@ -22,14 +21,11 @@ method:
             else:
                 self.write("Your cookie was set!")
 
-.. testoutput::
-   :hide:
-
 Cookies are not secure and can easily be modified by clients.  If you
 need to set cookies to, e.g., identify the currently logged in user,
 you need to sign your cookies to prevent forgery. Tornado supports
-signed cookies with the `~.RequestHandler.set_secure_cookie` and
-`~.RequestHandler.get_secure_cookie` methods. To use these methods,
+signed cookies with the `~.RequestHandler.set_signed_cookie` and
+`~.RequestHandler.get_signed_cookie` methods. To use these methods,
 you need to specify a secret key named ``cookie_secret`` when you
 create your application. You can pass in application settings as
 keyword arguments to your application:
@@ -40,37 +36,31 @@ keyword arguments to your application:
         (r"/", MainHandler),
     ], cookie_secret="__TODO:_GENERATE_YOUR_OWN_RANDOM_VALUE_HERE__")
 
-.. testoutput::
-   :hide:
-
 Signed cookies contain the encoded value of the cookie in addition to a
 timestamp and an `HMAC <http://en.wikipedia.org/wiki/HMAC>`_ signature.
 If the cookie is old or if the signature doesn't match,
-``get_secure_cookie`` will return ``None`` just as if the cookie isn't
+``get_signed_cookie`` will return ``None`` just as if the cookie isn't
 set. The secure version of the example above:
 
 .. testcode::
 
     class MainHandler(tornado.web.RequestHandler):
         def get(self):
-            if not self.get_secure_cookie("mycookie"):
-                self.set_secure_cookie("mycookie", "myvalue")
+            if not self.get_signed_cookie("mycookie"):
+                self.set_signed_cookie("mycookie", "myvalue")
                 self.write("Your cookie was not set yet!")
             else:
                 self.write("Your cookie was set!")
 
-.. testoutput::
-   :hide:
-
-Tornado's secure cookies guarantee integrity but not confidentiality.
+Tornado's signed cookies guarantee integrity but not confidentiality.
 That is, the cookie cannot be modified but its contents can be seen by the
 user.  The ``cookie_secret`` is a symmetric key and must be kept secret --
 anyone who obtains the value of this key could produce their own signed
 cookies.
 
-By default, Tornado's secure cookies expire after 30 days.  To change this,
-use the ``expires_days`` keyword argument to ``set_secure_cookie`` *and* the
-``max_age_days`` argument to ``get_secure_cookie``.  These two values are
+By default, Tornado's signed cookies expire after 30 days.  To change this,
+use the ``expires_days`` keyword argument to ``set_signed_cookie`` *and* the
+``max_age_days`` argument to ``get_signed_cookie``.  These two values are
 passed separately so that you may e.g. have a cookie that is valid for 30 days
 for most purposes, but for certain sensitive actions (such as changing billing
 information) you use a smaller ``max_age_days`` when reading the cookie.
@@ -82,7 +72,7 @@ signing key must then be set as ``key_version`` application setting
 but all other keys in the dict are allowed for cookie signature validation,
 if the correct key version is set in the cookie.
 To implement cookie updates, the current signing key version can be
-queried via `~.RequestHandler.get_secure_cookie_key_version`.
+queried via `~.RequestHandler.get_signed_cookie_key_version`.
 
 .. _user-authentication:
 
@@ -104,7 +94,7 @@ specifying a nickname, which is then saved in a cookie:
 
     class BaseHandler(tornado.web.RequestHandler):
         def get_current_user(self):
-            return self.get_secure_cookie("user")
+            return self.get_signed_cookie("user")
 
     class MainHandler(BaseHandler):
         def get(self):
@@ -122,16 +112,13 @@ specifying a nickname, which is then saved in a cookie:
                        '</form></body></html>')
 
         def post(self):
-            self.set_secure_cookie("user", self.get_argument("name"))
+            self.set_signed_cookie("user", self.get_argument("name"))
             self.redirect("/")
 
     application = tornado.web.Application([
         (r"/", MainHandler),
         (r"/login", LoginHandler),
     ], cookie_secret="__TODO:_GENERATE_YOUR_OWN_RANDOM_VALUE_HERE__")
-
-.. testoutput::
-   :hide:
 
 You can require that the user be logged in using the `Python
 decorator <http://www.python.org/dev/peps/pep-0318/>`_
@@ -156,9 +143,6 @@ rewritten:
         (r"/", MainHandler),
         (r"/login", LoginHandler),
     ], **settings)
-
-.. testoutput::
-   :hide:
 
 If you decorate ``post()`` methods with the ``authenticated``
 decorator, and the user is not logged in, the server will send a
@@ -194,7 +178,7 @@ the Google credentials in a cookie for later access:
                 user = await self.get_authenticated_user(
                     redirect_uri='http://your.site.com/auth/google',
                     code=self.get_argument('code'))
-                # Save the user with e.g. set_secure_cookie
+                # Save the user with e.g. set_signed_cookie
             else:
                 await self.authorize_redirect(
                     redirect_uri='http://your.site.com/auth/google',
@@ -203,31 +187,136 @@ the Google credentials in a cookie for later access:
                     response_type='code',
                     extra_params={'approval_prompt': 'auto'})
 
-.. testoutput::
-   :hide:
-
 See the `tornado.auth` module documentation for more details.
+
+..
+   The ``xsrf`` label is kept so that links to the old "Cross-site request
+   forgery protection" section continue to work. Internal links should use
+   ``cross_origin_protection`` or ``xsrf-cookies`` instead.
 
 .. _xsrf:
 
-Cross-site request forgery protection
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+.. _cross_origin_protection:
 
-`Cross-site request
-forgery <http://en.wikipedia.org/wiki/Cross-site_request_forgery>`_, or
-XSRF, is a common problem for personalized web applications. See the
-`Wikipedia
-article <http://en.wikipedia.org/wiki/Cross-site_request_forgery>`_ for
-more information on how XSRF works.
+Cross-origin protection
+~~~~~~~~~~~~~~~~~~~~~~~
 
-The generally accepted solution to prevent XSRF is to cookie every user
-with an unpredictable value and include that value as an additional
-argument with every form submission on your site. If the cookie and the
-value in the form submission do not match, then the request is likely
-forged.
+Cross-origin protection guards against a class of attacks most commonly known as
+`cross-site request
+forgery <http://en.wikipedia.org/wiki/Cross-site_request_forgery>`_ (XSRF or CSRF).
+This is a common problem for personalized web applications, in which a third-party
+site can construct a request which a visitor's browser will submit to your application
+along with the visitor's authentication cookies.
 
-Tornado comes with built-in XSRF protection. To include it in your site,
-include the application setting ``xsrf_cookies``:
+Modern browsers send a header which the server can use to identify and block
+cross-site requests. Tornado from version 6.6 can check this for you, if you
+enable the application setting ``cross_origin_protection``:
+
+.. testcode::
+
+    settings = {
+        "login_url": "/login",
+        "cross_origin_protection": True,
+    }
+    application = tornado.web.Application([
+        (r"/", MainHandler),
+        (r"/login", LoginHandler),
+    ], **settings)
+
+.. note::
+    This feature is a new security measure in the web stack. Tornado uses
+    the same terminology as Go's `cross-origin protection 
+    <https://pkg.go.dev/net/http#CrossOriginProtection>`_, with an algorithm based
+    on `this blog post by Filippo Valsorda <https://words.filippo.io/csrf/>`_. Other
+    packages and documents refer to it by different names, such as "fetch metadata"
+    or ``Sec-Fetch-Site``.
+    
+    Conversely, this feature is **unrelated** to Cross-Origin Resource Sharing (CORS)
+    and the ``Access-Control-Allow-Origin`` header. Applications using
+    ``cross_origin_protection`` should still consider their CORS requirements.
+
+
+With this setting, the application will reject state-changing requests if the
+`Sec-Fetch-Site <https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Sec-Fetch-Site>`_
+header is set to something other than ``same-origin`` or ``none``. If that
+header is missing, it rejects these requests if the ``Origin`` and ``Host``
+headers do not match. You can allow specific additional origins with the
+``trusted_origins`` application setting (a list).
+
+The ``cross_origin_protection`` setting was introduced in Tornado 6.6 and defaults
+to False. It is expected that in Tornado 6.7 it will be enabled by default.
+
+.. note::
+
+   These checks apply to HTTP verbs like ``POST`` or ``PUT``, which typically
+   modify application state. ``GET``, ``HEAD`` and ``OPTIONS`` requests should
+   not affect application state, and are not checked on the server, but the
+   browser can still keep the response from leaking.
+
+   The exception is WebSocket connections, which begin with a ``GET`` request
+   but are not subject to the browser's same-origin policy. `.WebSocketHandler`
+   always performs these checks, whether or not ``cross_origin_protection``
+   is enabled. Instead of `.RequestHandler.check_trusted_origin`, it calls
+   `.WebSocketHandler.check_origin` (after `~.RequestHandler.prepare`), whose
+   default implementation calls ``check_trusted_origin`` and therefore also
+   uses the ``trusted_origins`` setting.
+
+This protection is more convenient than older methods like XSRF cookies, described
+below, because it does not require any modifications to the HTML or JavaScript making
+the requests. It should be sufficient to protect most web applications from XSRF
+attacks.
+
+Some applications may need to customize the ``trusted_origins`` application setting (or
+override `.RequestHandler.check_trusted_origin`) to include additional domains that
+should be allowed to send cross-site requests. Note that an origin looks like the
+beginning of a url but never includes a trailing slash:
+
+.. code-block:: python
+
+    "trusted_origins": [
+        "https://example.com",
+        "https://example.org",
+    ],
+
+An "origin" is a smaller scope than a "site" (a site includes subdomains). This means that
+applications built for a site-based security model may need to include their subdomains as
+"trusted origins" to transition to ``cross_origin_protection``. Wildcards are not supported in
+the ``trusted_origins`` application setting but can be implemented by overriding
+`.RequestHandler.check_trusted_origin`.
+
+`.RequestHandler.check_trusted_origin` is called before `~.RequestHandler.prepare`,
+so it cannot depend on how (or whether) the request is authenticated. This is
+intentional: cookies are attached to cross-site requests automatically, so the
+origin must be checked before the request is allowed to act on its cookies.
+
+This protection relies on the ``Sec-Fetch-Site`` HTTP header, and, as a fallback for 
+when that header is not present, the ``Origin`` and ``Host`` headers. Any proxies
+or routers in your application serving stack must be configured to pass these headers
+through. Note that as XSRF is fundamentally a browser-based attack, requests from
+non-browser clients (which do not send ``Sec-Fetch-Site`` or ``Origin``) are always
+permitted. This means that if a proxy strips both of these headers, or a very old
+browser does not send them, the protection is silently disabled.
+
+All major browsers have supported the ``Sec-Fetch-Site`` header since 2023, although
+this header is only sent on HTTPS connections or to localhost. For older browsers or 
+unencrypted applications, we fall back to comparing the ``Origin`` and ``Host``
+headers.
+
+.. _xsrf-cookies:
+
+XSRF cookies
+^^^^^^^^^^^^
+
+Tornado supports a second, older method of preventing XSRF attacks using cookies. 
+This involves modifying every form submission on your site to include a value that
+can be compared with a cookie set for this purpose. This is an intrusive modification
+and is no longer recommended for new applications, although it was the only option
+available in Tornado before version 6.6.
+
+To use cookie-based XSRF protection, set the application setting ``xsrf_cookies`` to
+``True``, and modify your application as described below. The ``xsrf_cookies`` setting
+will emit deprecation warnings beginning in Tornado 6.7 and may be removed in future
+versions (Tornado 7.0 at the earliest).
 
 .. testcode::
 
@@ -240,9 +329,6 @@ include the application setting ``xsrf_cookies``:
         (r"/", MainHandler),
         (r"/login", LoginHandler),
     ], **settings)
-
-.. testoutput::
-   :hide:
 
 If ``xsrf_cookies`` is set, the Tornado web application will set the
 ``_xsrf`` cookie for all users and reject all ``POST``, ``PUT``, and

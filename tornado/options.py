@@ -56,7 +56,7 @@ Your ``main()`` method can parse the command line or parse a config file with
 either `parse_command_line` or `parse_config_file`::
 
     import myapp.db, myapp.server
-    import tornado.options
+    import tornado
 
     if __name__ == '__main__':
         tornado.options.parse_command_line()
@@ -86,6 +86,12 @@ instances to define isolated sets of options, such as for subcommands.
        options.logging = None
        parse_command_line()
 
+.. note::
+
+   `parse_command_line` or `parse_config_file` function should called after
+   logging configuration and user-defined command line flags using the
+   ``callback`` option definition, or these configurations will not take effect.
+
 .. versionchanged:: 4.3
    Dashes and underscores are fully interchangeable in option names;
    options can be defined, set, and read with any mix of the two.
@@ -95,27 +101,19 @@ instances to define isolated sets of options, such as for subcommands.
 
 import datetime
 import numbers
+import os
 import re
 import sys
-import os
 import textwrap
+from collections.abc import Callable, Iterable, Iterator
+from typing import (
+    Any,
+    TextIO,
+)
 
 from tornado.escape import _unicode, native_str
 from tornado.log import define_logging_options
 from tornado.util import basestring_type, exec_in
-
-from typing import (
-    Any,
-    Iterator,
-    Iterable,
-    Tuple,
-    Set,
-    Dict,
-    Callable,
-    List,
-    TextIO,
-    Optional,
-)
 
 
 class Error(Exception):
@@ -124,7 +122,7 @@ class Error(Exception):
     pass
 
 
-class OptionParser(object):
+class OptionParser:
     """A collection of options, a dictionary with object-like access.
 
     Normally accessed via static functions in the `tornado.options` module,
@@ -154,10 +152,11 @@ class OptionParser(object):
     def __setattr__(self, name: str, value: Any) -> None:
         name = self._normalize_name(name)
         if isinstance(self._options.get(name), _Option):
-            return self._options[name].set(value)
+            self._options[name].set(value)
+            return
         raise AttributeError("Unrecognized option %r" % name)
 
-    def __iter__(self) -> Iterator:
+    def __iter__(self) -> Iterator[Any]:
         return (opt.name for opt in self._options.values())
 
     def __contains__(self, name: str) -> bool:
@@ -170,21 +169,21 @@ class OptionParser(object):
     def __setitem__(self, name: str, value: Any) -> None:
         return self.__setattr__(name, value)
 
-    def items(self) -> Iterable[Tuple[str, Any]]:
+    def items(self) -> Iterable[tuple[str, Any]]:
         """An iterable of (name, value) pairs.
 
         .. versionadded:: 3.1
         """
         return [(opt.name, opt.value()) for name, opt in self._options.items()]
 
-    def groups(self) -> Set[str]:
+    def groups(self) -> set[str]:
         """The set of option-groups created by ``define``.
 
         .. versionadded:: 3.1
         """
-        return set(opt.group_name for opt in self._options.values())
+        return {opt.group_name for opt in self._options.values()}
 
-    def group_dict(self, group: str) -> Dict[str, Any]:
+    def group_dict(self, group: str) -> dict[str, Any]:
         """The names and values of options in a group.
 
         Useful for copying options into Application settings::
@@ -201,29 +200,29 @@ class OptionParser(object):
 
         .. versionadded:: 3.1
         """
-        return dict(
-            (opt.name, opt.value())
+        return {
+            opt.name: opt.value()
             for name, opt in self._options.items()
             if not group or group == opt.group_name
-        )
+        }
 
-    def as_dict(self) -> Dict[str, Any]:
+    def as_dict(self) -> dict[str, Any]:
         """The names and values of all options.
 
         .. versionadded:: 3.1
         """
-        return dict((opt.name, opt.value()) for name, opt in self._options.items())
+        return {opt.name: opt.value() for name, opt in self._options.items()}
 
     def define(
         self,
         name: str,
         default: Any = None,
-        type: Optional[type] = None,
-        help: Optional[str] = None,
-        metavar: Optional[str] = None,
+        type: type | None = None,
+        help: str | None = None,
+        metavar: str | None = None,
         multiple: bool = False,
-        group: Optional[str] = None,
-        callback: Optional[Callable[[Any], None]] = None,
+        group: str | None = None,
+        callback: Callable[[Any], None] | None = None,
     ) -> None:
         """Defines a new command line option.
 
@@ -290,7 +289,7 @@ class OptionParser(object):
             else:
                 type = str
         if group:
-            group_name = group  # type: Optional[str]
+            group_name: str | None = group
         else:
             group_name = file_name
         option = _Option(
@@ -307,8 +306,8 @@ class OptionParser(object):
         self._options[normalized] = option
 
     def parse_command_line(
-        self, args: Optional[List[str]] = None, final: bool = True
-    ) -> List[str]:
+        self, args: list[str] | None = None, final: bool = True
+    ) -> list[str]:
         """Parses all options given on the command line (defaults to
         `sys.argv`).
 
@@ -332,7 +331,7 @@ class OptionParser(object):
         """
         if args is None:
             args = sys.argv
-        remaining = []  # type: List[str]
+        remaining: list[str] = []
         for i in range(1, len(args)):
             # All things after the last option are command line arguments
             if not args[i].startswith("-"):
@@ -421,7 +420,9 @@ class OptionParser(object):
                             % (option.name, option.type.__name__)
                         )
 
-                if type(config[name]) == str and option.type != str:
+                if type(config[name]) is str and (
+                    option.type is not str or option.multiple
+                ):
                     option.parse(config[name])
                 else:
                     option.set(config[name])
@@ -429,13 +430,13 @@ class OptionParser(object):
         if final:
             self.run_parse_callbacks()
 
-    def print_help(self, file: Optional[TextIO] = None) -> None:
+    def print_help(self, file: TextIO | None = None) -> None:
         """Prints all the command line options to stderr (or another file)."""
         if file is None:
             file = sys.stderr
         print("Usage: %s [OPTIONS]" % sys.argv[0], file=file)
         print("\nOptions:\n", file=file)
-        by_group = {}  # type: Dict[str, List[_Option]]
+        by_group: dict[str, list[_Option]] = {}
         for option in self._options.values():
             by_group.setdefault(option.group_name, []).append(option)
 
@@ -474,15 +475,11 @@ class OptionParser(object):
 
     def mockable(self) -> "_Mockable":
         """Returns a wrapper around self that is compatible with
-        `mock.patch <unittest.mock.patch>`.
+        `unittest.mock.patch`.
 
-        The `mock.patch <unittest.mock.patch>` function (included in
-        the standard library `unittest.mock` package since Python 3.3,
-        or in the third-party ``mock`` package for older versions of
-        Python) is incompatible with objects like ``options`` that
-        override ``__getattr__`` and ``__setattr__``.  This function
-        returns an object that can be used with `mock.patch.object
-        <unittest.mock.patch.object>` to modify option values::
+        The `unittest.mock.patch` function is incompatible with objects like ``options`` that
+        override ``__getattr__`` and ``__setattr__``.  This function returns an object that can be
+        used with `mock.patch.object <unittest.mock.patch.object>` to modify option values::
 
             with mock.patch.object(options.mockable(), 'name', value):
                 assert options.name == value
@@ -490,7 +487,7 @@ class OptionParser(object):
         return _Mockable(self)
 
 
-class _Mockable(object):
+class _Mockable:
     """`mock.patch` compatible wrapper for `OptionParser`.
 
     As of ``mock`` version 1.0.1, when an object uses ``__getattr__``
@@ -520,7 +517,7 @@ class _Mockable(object):
         setattr(self._options, name, self._originals.pop(name))
 
 
-class _Option(object):
+class _Option:
     # This class could almost be made generic, but the way the types
     # interact with the multiple argument makes this tricky. (default
     # and the callback use List[T], but type is still Type[T]).
@@ -530,13 +527,13 @@ class _Option(object):
         self,
         name: str,
         default: Any = None,
-        type: Optional[type] = None,
-        help: Optional[str] = None,
-        metavar: Optional[str] = None,
+        type: type | None = None,
+        help: str | None = None,
+        metavar: str | None = None,
         multiple: bool = False,
-        file_name: Optional[str] = None,
-        group_name: Optional[str] = None,
-        callback: Optional[Callable[[Any], None]] = None,
+        file_name: str | None = None,
+        group_name: str | None = None,
+        callback: Callable[[Any], None] | None = None,
     ) -> None:
         if default is None and multiple:
             default = []
@@ -551,20 +548,18 @@ class _Option(object):
         self.group_name = group_name
         self.callback = callback
         self.default = default
-        self._value = _Option.UNSET  # type: Any
+        self._value: Any = _Option.UNSET
 
     def value(self) -> Any:
         return self.default if self._value is _Option.UNSET else self._value
 
     def parse(self, value: str) -> Any:
-        _parse = {
+        _parse: Callable[[str], Any] = {
             datetime.datetime: self._parse_datetime,
             datetime.timedelta: self._parse_timedelta,
             bool: self._parse_bool,
             basestring_type: self._parse_string,
-        }.get(
-            self.type, self.type
-        )  # type: Callable[[str], Any]
+        }.get(self.type, self.type)
         if self.multiple:
             self._value = []
             for part in value.split(","):
@@ -639,7 +634,7 @@ class _Option(object):
         "w": "weeks",
     }
 
-    _FLOAT_PATTERN = r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?"
+    _FLOAT_PATTERN = r"[-+]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][-+]?[0-9]+)?"
 
     _TIMEDELTA_PATTERN = re.compile(
         r"\s*(%s)\s*(\w*)\s*" % _FLOAT_PATTERN, re.IGNORECASE
@@ -656,9 +651,8 @@ class _Option(object):
                 num = float(m.group(1))
                 units = m.group(2) or "seconds"
                 units = self._TIMEDELTA_ABBREV_DICT.get(units, units)
-                # This line confuses mypy when setup.py sets python_version=3.6
-                # https://github.com/python/mypy/issues/9676
-                sum += datetime.timedelta(**{units: num})  # type: ignore
+
+                sum += datetime.timedelta(**{units: num})
                 start = m.end()
             return sum
         except Exception:
@@ -681,12 +675,12 @@ All defined options are available as attributes on this object.
 def define(
     name: str,
     default: Any = None,
-    type: Optional[type] = None,
-    help: Optional[str] = None,
-    metavar: Optional[str] = None,
+    type: type | None = None,
+    help: str | None = None,
+    metavar: str | None = None,
     multiple: bool = False,
-    group: Optional[str] = None,
-    callback: Optional[Callable[[Any], None]] = None,
+    group: str | None = None,
+    callback: Callable[[Any], None] | None = None,
 ) -> None:
     """Defines an option in the global namespace.
 
@@ -704,9 +698,7 @@ def define(
     )
 
 
-def parse_command_line(
-    args: Optional[List[str]] = None, final: bool = True
-) -> List[str]:
+def parse_command_line(args: list[str] | None = None, final: bool = True) -> list[str]:
     """Parses global options from the command line.
 
     See `OptionParser.parse_command_line`.
@@ -722,7 +714,7 @@ def parse_config_file(path: str, final: bool = True) -> None:
     return options.parse_config_file(path, final=final)
 
 
-def print_help(file: Optional[TextIO] = None) -> None:
+def print_help(file: TextIO | None = None) -> None:
     """Prints all the command line options to stderr (or another file).
 
     See `OptionParser.print_help`.

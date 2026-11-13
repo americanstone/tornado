@@ -117,9 +117,27 @@
    .. automethod:: RequestHandler.set_cookie
    .. automethod:: RequestHandler.clear_cookie
    .. automethod:: RequestHandler.clear_all_cookies
-   .. automethod:: RequestHandler.get_secure_cookie
-   .. automethod:: RequestHandler.get_secure_cookie_key_version
-   .. automethod:: RequestHandler.set_secure_cookie
+   .. automethod:: RequestHandler.get_signed_cookie
+   .. automethod:: RequestHandler.get_signed_cookie_key_version
+   .. automethod:: RequestHandler.set_signed_cookie
+   .. method:: RequestHandler.get_secure_cookie
+
+      Deprecated alias for ``get_signed_cookie``.
+
+      .. deprecated:: 6.3
+
+   .. method:: RequestHandler.get_secure_cookie_key_version
+
+      Deprecated alias for ``get_signed_cookie_key_version``.
+
+      .. deprecated:: 6.3
+
+   .. method:: RequestHandler.set_secure_cookie
+
+      Deprecated alias for ``set_signed_cookie``.
+
+      .. deprecated:: 6.3
+
    .. automethod:: RequestHandler.create_signed_value
    .. autodata:: MIN_SUPPORTED_SIGNED_VALUE_VERSION
    .. autodata:: MAX_SUPPORTED_SIGNED_VALUE_VERSION
@@ -134,6 +152,7 @@
       The `Application` object serving this request
 
    .. automethod:: RequestHandler.check_etag_header
+   .. automethod:: RequestHandler.check_trusted_origin
    .. automethod:: RequestHandler.check_xsrf_cookie
    .. automethod:: RequestHandler.compute_etag
    .. automethod:: RequestHandler.create_template_loader
@@ -206,26 +225,42 @@
            of `UIModule` or UI methods to be made available to templates.
            May be set to a module, dictionary, or a list of modules
            and/or dicts.  See :ref:`ui-modules` for more details.
-         * ``websocket_ping_interval``: If set to a number, all websockets will
-           be pinged every n seconds. This can help keep the connection alive
-           through certain proxy servers which close idle connections, and it
-           can detect if the websocket has failed without being properly closed.
-         * ``websocket_ping_timeout``: If the ping interval is set, and the
-           server doesn't receive a 'pong' in this many seconds, it will close
-           the websocket. The default is three times the ping interval, with a
-           minimum of 30 seconds. Ignored if the ping interval is not set.
+         * ``websocket_ping_interval``: If the ping interval has a non-zero
+           value, a ping will be sent periodically every
+           ``websocket_ping_interval`` seconds, and the connection will be
+           closed if a response is not received before the
+           ``websocket_ping_timeout``.
+           This can help keep the connection alive through certain proxy
+           servers which close idle connections, and it can detect if the
+           websocket has failed without being properly closed.
+         * ``websocket_ping_timeout``: For use with ``websocket_ping_interval``,
+           if the server does not receive a pong within this many seconds, it
+           will close the websocket_ping_timeout.
+           The default timeout is equal to the ping interval. The ping timeout
+           will be turned off if the ping interval is not set or if the
+           timeout is set to ``0``.
+           This can help to detect disconnected clients to avoid keeping
+           inactive connections open.
 
          Authentication and security settings:
 
-         * ``cookie_secret``: Used by `RequestHandler.get_secure_cookie`
-           and `.set_secure_cookie` to sign cookies.
-         * ``key_version``: Used by requestHandler `.set_secure_cookie`
+         * ``cookie_secret``: Used by `RequestHandler.get_signed_cookie`
+           and `.set_signed_cookie` to sign cookies.
+         * ``cross_origin_protection``: If ``True``, :ref:`cross_origin_protection` is enabled.
+           New in Tornado 6.6.
+         * ``key_version``: Used by requestHandler `.set_signed_cookie`
            to sign cookies with a specific key when ``cookie_secret``
            is a key dictionary.
          * ``login_url``: The `authenticated` decorator will redirect
            to this url if the user is not logged in.  Can be further
            customized by overriding `RequestHandler.get_login_url`
-         * ``xsrf_cookies``: If ``True``, :ref:`xsrf` will be enabled.
+         * ``trusted_origins``: A list of origins (as in the HTTP ``Origin``
+           header, such as ``https://example.com``, without a trailing slash)
+           from which to allow cross-origin requests. Used by the default
+           implementation of `RequestHandler.check_trusted_origin`, for both
+           ``cross_origin_protection`` and (via the default implementation of
+           `.WebSocketHandler.check_origin`) websockets. New in Tornado 6.6.
+         * ``xsrf_cookies``: If ``True``, :ref:`xsrf-cookies` will be enabled.
          * ``xsrf_cookie_version``: Controls the version of new XSRF
            cookies produced by this server.  Should generally be left
            at the default (which will always be the highest supported
@@ -235,11 +270,20 @@
          * ``xsrf_cookie_kwargs``: May be set to a dictionary of
            additional arguments to be passed to `.RequestHandler.set_cookie`
            for the XSRF cookie.
+         * ``xsrf_cookie_name``: Controls the name used for the XSRF
+           cookie (default ``_xsrf``). The intended use is to take
+           advantage of `cookie prefixes`_. Note that cookie prefixes
+           interact with other cookie flags, so they must be combined
+           with ``xsrf_cookie_kwargs``, such as
+           ``{"xsrf_cookie_name": "__Host-xsrf", "xsrf_cookie_kwargs":
+           {"secure": True}}``
          * ``twitter_consumer_key``, ``twitter_consumer_secret``,
            ``friendfeed_consumer_key``, ``friendfeed_consumer_secret``,
            ``google_consumer_key``, ``google_consumer_secret``,
            ``facebook_api_key``, ``facebook_secret``:  Used in the
            `tornado.auth` module to authenticate to various APIs.
+
+         .. _cookie prefixes: https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Set-Cookie#cookie_prefixes
 
          Template settings:
 

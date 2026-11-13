@@ -11,19 +11,18 @@
 # under the License.
 
 import asyncio
-from datetime import timedelta
-import typing  # noqa: F401
 import unittest
+from datetime import timedelta
 
 from tornado import gen, locks
-from tornado.gen import TimeoutError
-from tornado.testing import gen_test, AsyncTestCase
+from tornado.test.util import AsyncTestCase
+from tornado.testing import gen_test
 
 
 class ConditionTest(AsyncTestCase):
     def setUp(self):
         super().setUp()
-        self.history = []  # type: typing.List[typing.Union[int, str]]
+        self.history: list[int | str] = []
 
     def record_done(self, future, key):
         """Record the resolution of a Future returned by Condition.wait."""
@@ -99,7 +98,7 @@ class ConditionTest(AsyncTestCase):
         self.history.append("notify_all")
 
         # Callbacks execute in the order they were registered.
-        self.assertEqual(list(range(4)) + ["notify_all"], self.history)  # type: ignore
+        self.assertEqual(list(range(4)) + ["notify_all"], self.history)
 
     @gen_test
     def test_wait_timeout(self):
@@ -283,7 +282,7 @@ class SemaphoreTest(AsyncTestCase):
         acquire = sem.acquire(timedelta(seconds=0.01))
         self.io_loop.call_later(0.02, sem.release)  # Too late.
         yield gen.sleep(0.3)
-        with self.assertRaises(gen.TimeoutError):
+        with self.assertRaises(TimeoutError):
             yield acquire
 
         sem.acquire()
@@ -346,7 +345,7 @@ class SemaphoreContextManagerTest(AsyncTestCase):
     def test_context_manager(self):
         sem = locks.Semaphore()
         with (yield sem.acquire()) as yielded:
-            self.assertTrue(yielded is None)
+            self.assertIsNone(yielded)
 
         # Semaphore was released and can be acquired again.
         self.assertTrue(asyncio.ensure_future(sem.acquire()).done())
@@ -358,7 +357,7 @@ class SemaphoreContextManagerTest(AsyncTestCase):
 
         async def f():
             async with sem as yielded:
-                self.assertTrue(yielded is None)
+                self.assertIsNone(yielded)
 
         yield f()
 
@@ -387,7 +386,7 @@ class SemaphoreContextManagerTest(AsyncTestCase):
     @gen_test
     def test_context_manager_timeout_error(self):
         sem = locks.Semaphore(value=0)
-        with self.assertRaises(gen.TimeoutError):
+        with self.assertRaises(TimeoutError):
             with (yield sem.acquire(timedelta(seconds=0.01))):
                 pass
 
@@ -502,7 +501,7 @@ class LockTests(AsyncTestCase):
     def test_acquire_timeout(self):
         lock = locks.Lock()
         lock.acquire()
-        with self.assertRaises(gen.TimeoutError):
+        with self.assertRaises(TimeoutError):
             yield lock.acquire(timeout=timedelta(seconds=0.01))
 
         # Still locked.

@@ -19,7 +19,6 @@ extensions = [
     "sphinx.ext.doctest",
     "sphinx.ext.intersphinx",
     "sphinx.ext.viewcode",
-    "sphinxcontrib.asyncio",
 ]
 
 primary_domain = "py"
@@ -35,7 +34,9 @@ autodoc_inherit_docstrings = False
 autodoc_docstring_signature = False
 
 coverage_skip_undoc_in_source = True
+coverage_show_missing_items = True
 coverage_ignore_modules = [
+    "tornado.curl_httpclient",
     "tornado.platform.asyncio",
     "tornado.platform.caresresolver",
     "tornado.platform.twisted",
@@ -84,22 +85,14 @@ latex_documents = [
 
 intersphinx_mapping = {"python": ("https://docs.python.org/3/", None)}
 
-on_rtd = os.environ.get("READTHEDOCS", None) == "True"
-
-# On RTD we can't import sphinx_rtd_theme, but it will be applied by
-# default anyway.  This block will use the same theme when building locally
-# as on RTD.
-if not on_rtd:
-    import sphinx_rtd_theme
-
-    html_theme = "sphinx_rtd_theme"
-    html_theme_path = [sphinx_rtd_theme.get_html_theme_path()]
+html_theme = "sphinx_rtd_theme"
 
 # Suppress warnings about "class reference target not found" for these types.
 # In most cases these types come from type annotations and are for mypy's use.
 missing_references = {
     # Generic type variables; nothing to link to.
     "_IOStreamType",
+    "_P",
     "_S",
     "_T",
     # Standard library types which are defined in one module and documented
@@ -113,6 +106,7 @@ missing_references = {
     "concurrent.futures._base.Future",
     "futures.Future",
     "socket.socket",
+    "unittest.case.TestCase",
     "TextIO",
     # Other stuff. I'm not sure why some of these are showing up, but
     # I'm just listing everything here to avoid blocking the upgrade of sphinx.
@@ -123,11 +117,21 @@ missing_references = {
     "Pattern",
     "RAISE",
     "Rule",
+    "socket.AddressFamily",
+    "tornado.concurrent._T",
+    "tornado.gen._T",
+    "tornado.ioloop._S",
+    "tornado.ioloop._T",
     "tornado.ioloop._Selectable",
+    "tornado.iostream._IOStreamType",
     "tornado.locks._ReleasingContextManager",
+    "tornado.queues._T",
+    "tornado.testing._T",
     "tornado.options._Mockable",
     "tornado.web._ArgDefaultMarker",
     "tornado.web._HandlerDelegate",
+    "tornado.web._RequestHandlerType",
+    "_RequestHandlerType",
     "traceback",
     "WSGIAppType",
     "Yieldable",
@@ -139,5 +143,47 @@ def missing_reference_handler(app, env, node, contnode):
         raise sphinx.errors.NoUri
 
 
+def viewcode_follow_imported(app, modname, fullname):
+    """Keep sphinx.ext.viewcode from linking to modules outside tornado.
+
+    By default, viewcode follows each documented object to the module named
+    by its ``__module__`` attribute. For aliases of objects defined elsewhere
+    (e.g. ``tornado.process.CalledProcessError`` is
+    ``subprocess.CalledProcessError``, ``tornado.util.TimeoutError`` is the
+    builtin ``TimeoutError``, and ``tornado.concurrent.Future`` is
+    ``asyncio.Future``, whose ``__module__`` is ``_asyncio``), that adds
+    stdlib modules to ``_modules/index.html``, and modules without Python
+    source (``builtins``, ``_asyncio``) show up there as broken links.
+
+    Follow imports only when they lead to another tornado module (so
+    ``tornado.web.URLSpec`` still links to its source in ``tornado.routing``);
+    otherwise look the object up in the module where it is documented, which
+    yields no source link for aliases of external objects.
+    """
+    obj = sys.modules.get(modname)
+    for attr in fullname.split("."):
+        obj = getattr(obj, attr, None)
+    real_modname = getattr(obj, "__module__", None)
+    if isinstance(real_modname, str) and (
+        real_modname == "tornado" or real_modname.startswith("tornado.")
+    ):
+        return real_modname
+    return modname
+
+
 def setup(app):
     app.connect("missing-reference", missing_reference_handler)
+    app.connect("viewcode-follow-imported", viewcode_follow_imported)
+
+
+# Read the Docs configuration updates from
+# https://about.readthedocs.com/blog/2024/07/addons-by-default/
+
+# Define the canonical URL if you are using a custom domain on Read the Docs
+html_baseurl = os.environ.get("READTHEDOCS_CANONICAL_URL", "")
+
+# Tell Jinja2 templates the build is running on Read the Docs
+if os.environ.get("READTHEDOCS", "") == "True":
+    if "html_context" not in globals():
+        html_context = {}
+    html_context["READTHEDOCS"] = True

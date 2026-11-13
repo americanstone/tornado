@@ -3,53 +3,23 @@
 # and ensure that it doesn't blow up (e.g. with unicode/bytes issues in
 # python 3)
 
-import unittest
+from unittest import mock
 
+from tornado import gen
 from tornado.auth import (
-    OpenIdMixin,
-    OAuthMixin,
-    OAuth2Mixin,
-    GoogleOAuth2Mixin,
     FacebookGraphMixin,
+    GoogleOAuth2Mixin,
+    OAuth2Mixin,
+    OAuthMixin,
     TwitterMixin,
 )
 from tornado.escape import json_decode
-from tornado import gen
 from tornado.httpclient import HTTPClientError
 from tornado.httputil import url_concat
 from tornado.log import app_log
-from tornado.testing import AsyncHTTPTestCase, ExpectLog
-from tornado.web import RequestHandler, Application, HTTPError
-
-try:
-    from unittest import mock
-except ImportError:
-    mock = None  # type: ignore
-
-
-class OpenIdClientLoginHandler(RequestHandler, OpenIdMixin):
-    def initialize(self, test):
-        self._OPENID_ENDPOINT = test.get_url("/openid/server/authenticate")
-
-    @gen.coroutine
-    def get(self):
-        if self.get_argument("openid.mode", None):
-            user = yield self.get_authenticated_user(
-                http_client=self.settings["http_client"]
-            )
-            if user is None:
-                raise Exception("user is None")
-            self.finish(user)
-            return
-        res = self.authenticate_redirect()  # type: ignore
-        assert res is None
-
-
-class OpenIdServerAuthenticateHandler(RequestHandler):
-    def post(self):
-        if self.get_argument("openid.mode") != "check_authentication":
-            raise Exception("incorrect openid.mode %r")
-        self.write("is_valid:true")
+from tornado.testing import ExpectLog
+from tornado.test.util import AsyncHTTPTestCase
+from tornado.web import Application, HTTPError, RequestHandler
 
 
 class OAuth1ClientLoginHandler(RequestHandler, OAuthMixin):
@@ -74,8 +44,7 @@ class OAuth1ClientLoginHandler(RequestHandler, OAuthMixin):
             return
         yield self.authorize_redirect(http_client=self.settings["http_client"])
 
-    @gen.coroutine
-    def _oauth_get_user_future(self, access_token):
+    async def _oauth_get_user_future(self, access_token):
         if self.get_argument("fail_in_get_user", None):
             raise Exception("failing in get_user")
         if access_token != dict(key="uiop", secret="5678"):
@@ -274,7 +243,6 @@ class AuthTest(AsyncHTTPTestCase):
         return Application(
             [
                 # test endpoints
-                ("/openid/client/login", OpenIdClientLoginHandler, dict(test=self)),
                 (
                     "/oauth10/client/login",
                     OAuth1ClientLoginHandler,
@@ -319,7 +287,6 @@ class AuthTest(AsyncHTTPTestCase):
                     dict(test=self),
                 ),
                 # simulated servers
-                ("/openid/server/authenticate", OpenIdServerAuthenticateHandler),
                 ("/oauth1/server/request_token", OAuth1ServerRequestTokenHandler),
                 ("/oauth1/server/access_token", OAuth1ServerAccessTokenHandler),
                 ("/facebook/server/access_token", FacebookServerAccessTokenHandler),
@@ -338,22 +305,6 @@ class AuthTest(AsyncHTTPTestCase):
             facebook_secret="test_facebook_secret",
         )
 
-    def test_openid_redirect(self):
-        response = self.fetch("/openid/client/login", follow_redirects=False)
-        self.assertEqual(response.code, 302)
-        self.assertTrue("/openid/server/authenticate?" in response.headers["Location"])
-
-    def test_openid_get_user(self):
-        response = self.fetch(
-            "/openid/client/login?openid.mode=blah"
-            "&openid.ns.ax=http://openid.net/srv/ax/1.0"
-            "&openid.ax.type.email=http://axschema.org/contact/email"
-            "&openid.ax.value.email=foo@example.com"
-        )
-        response.rethrow()
-        parsed = json_decode(response.body)
-        self.assertEqual(parsed["email"], "foo@example.com")
-
     def test_oauth10_redirect(self):
         response = self.fetch("/oauth10/client/login", follow_redirects=False)
         self.assertEqual(response.code, 302)
@@ -363,9 +314,9 @@ class AuthTest(AsyncHTTPTestCase):
             )
         )
         # the cookie is base64('zxcv')|base64('1234')
-        self.assertTrue(
-            '_oauth_request_token="enhjdg==|MTIzNA=="'
-            in response.headers["Set-Cookie"],
+        self.assertIn(
+            '_oauth_request_token="enhjdg==|MTIzNA=="',
+            response.headers["Set-Cookie"],
             response.headers["Set-Cookie"],
         )
 
@@ -385,8 +336,8 @@ class AuthTest(AsyncHTTPTestCase):
         parsed = json_decode(response.body)
         self.assertEqual(parsed["oauth_consumer_key"], "asdf")
         self.assertEqual(parsed["oauth_token"], "uiop")
-        self.assertTrue("oauth_nonce" in parsed)
-        self.assertTrue("oauth_signature" in parsed)
+        self.assertIn("oauth_nonce", parsed)
+        self.assertIn("oauth_signature", parsed)
 
     def test_oauth10a_redirect(self):
         response = self.fetch("/oauth10a/client/login", follow_redirects=False)
@@ -403,7 +354,6 @@ class AuthTest(AsyncHTTPTestCase):
             response.headers["Set-Cookie"],
         )
 
-    @unittest.skipIf(mock is None, "mock package not present")
     def test_oauth10a_redirect_error(self):
         with mock.patch.object(OAuth1ServerRequestTokenHandler, "get") as get:
             get.side_effect = Exception("boom")
@@ -427,8 +377,8 @@ class AuthTest(AsyncHTTPTestCase):
         parsed = json_decode(response.body)
         self.assertEqual(parsed["oauth_consumer_key"], "asdf")
         self.assertEqual(parsed["oauth_token"], "uiop")
-        self.assertTrue("oauth_nonce" in parsed)
-        self.assertTrue("oauth_signature" in parsed)
+        self.assertIn("oauth_nonce", parsed)
+        self.assertIn("oauth_signature", parsed)
 
     def test_oauth10a_get_user_coroutine_exception(self):
         response = self.fetch(
@@ -440,7 +390,7 @@ class AuthTest(AsyncHTTPTestCase):
     def test_oauth2_redirect(self):
         response = self.fetch("/oauth2/client/login", follow_redirects=False)
         self.assertEqual(response.code, 302)
-        self.assertTrue("/oauth2/server/authorize?" in response.headers["Location"])
+        self.assertIn("/oauth2/server/authorize?", response.headers["Location"])
 
     def test_facebook_login(self):
         response = self.fetch("/facebook/client/login", follow_redirects=False)
@@ -464,9 +414,9 @@ class AuthTest(AsyncHTTPTestCase):
             )
         )
         # the cookie is base64('zxcv')|base64('1234')
-        self.assertTrue(
-            '_oauth_request_token="enhjdg==|MTIzNA=="'
-            in response.headers["Set-Cookie"],
+        self.assertIn(
+            '_oauth_request_token="enhjdg==|MTIzNA=="',
+            response.headers["Set-Cookie"],
             response.headers["Set-Cookie"],
         )
 
@@ -486,9 +436,9 @@ class AuthTest(AsyncHTTPTestCase):
             response.headers["Location"],
         )
         # the cookie is base64('zxcv')|base64('1234')
-        self.assertTrue(
-            '_oauth_request_token="enhjdg==|MTIzNA=="'
-            in response.headers["Set-Cookie"],
+        self.assertIn(
+            '_oauth_request_token="enhjdg==|MTIzNA=="',
+            response.headers["Set-Cookie"],
             response.headers["Set-Cookie"],
         )
 
@@ -502,14 +452,14 @@ class AuthTest(AsyncHTTPTestCase):
         self.assertEqual(
             parsed,
             {
-                u"access_token": {
-                    u"key": u"hjkl",
-                    u"screen_name": u"foo",
-                    u"secret": u"vbnm",
+                "access_token": {
+                    "key": "hjkl",
+                    "screen_name": "foo",
+                    "secret": "vbnm",
                 },
-                u"name": u"Foo",
-                u"screen_name": u"foo",
-                u"username": u"foo",
+                "name": "Foo",
+                "screen_name": "foo",
+                "username": "foo",
             },
         )
 
@@ -550,7 +500,6 @@ class GoogleLoginHandler(RequestHandler, GoogleOAuth2Mixin):
             self.authorize_redirect(
                 redirect_uri=self._OAUTH_REDIRECT_URI,
                 client_id=self.settings["google_oauth"]["key"],
-                client_secret=self.settings["google_oauth"]["secret"],
                 scope=["profile", "email"],
                 response_type="code",
                 extra_params={"prompt": "select_account"},
@@ -601,9 +550,9 @@ class GoogleOAuth2Test(AsyncHTTPTestCase):
         response = self.fetch("/client/login")
         self.assertDictEqual(
             {
-                u"name": u"Foo",
-                u"email": u"foo@example.com",
-                u"access_token": u"fake-access-token",
+                "name": "Foo",
+                "email": "foo@example.com",
+                "access_token": "fake-access-token",
             },
             json_decode(response.body),
         )

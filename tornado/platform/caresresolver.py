@@ -1,28 +1,28 @@
-import pycares  # type: ignore
 import socket
+import typing
+from collections.abc import Generator
+from typing import Any
 
-from tornado.concurrent import Future
+import pycares  # type: ignore
+
 from tornado import gen
+from tornado.concurrent import Future
 from tornado.ioloop import IOLoop
 from tornado.netutil import Resolver, is_valid_ip
-
-import typing
-
-if typing.TYPE_CHECKING:
-    from typing import Generator, Any, List, Tuple, Dict  # noqa: F401
 
 
 class CaresResolver(Resolver):
     """Name resolver based on the c-ares library.
 
-    This is a non-blocking and non-threaded resolver.  It may not produce
-    the same results as the system resolver, but can be used for non-blocking
+    This is a non-blocking and non-threaded resolver.  It may not produce the
+    same results as the system resolver, but can be used for non-blocking
     resolution when threads cannot be used.
 
-    c-ares fails to resolve some names when ``family`` is ``AF_UNSPEC``,
-    so it is only recommended for use in ``AF_INET`` (i.e. IPv4).  This is
-    the default for ``tornado.simple_httpclient``, but other libraries
-    may default to ``AF_UNSPEC``.
+    ``pycares`` will not return a mix of ``AF_INET`` and ``AF_INET6`` when
+    ``family`` is ``AF_UNSPEC``, so it is only recommended for use in
+    ``AF_INET`` (i.e. IPv4).  This is the default for
+    ``tornado.simple_httpclient``, but other libraries may default to
+    ``AF_UNSPEC``.
 
     .. versionchanged:: 5.0
        The ``io_loop`` argument (deprecated since version 4.1) has been removed.
@@ -35,7 +35,7 @@ class CaresResolver(Resolver):
     def initialize(self) -> None:
         self.io_loop = IOLoop.current()
         self.channel = pycares.Channel(sock_state_cb=self._sock_state_cb)
-        self.fds = {}  # type: Dict[int, int]
+        self.fds: dict[int, int] = {}
 
     def _sock_state_cb(self, fd: int, readable: bool, writable: bool) -> None:
         state = (IOLoop.READ if readable else 0) | (IOLoop.WRITE if writable else 0)
@@ -61,18 +61,18 @@ class CaresResolver(Resolver):
     @gen.coroutine
     def resolve(
         self, host: str, port: int, family: int = 0
-    ) -> "Generator[Any, Any, List[Tuple[int, Any]]]":
+    ) -> "Generator[Any, Any, list[tuple[int, Any]]]":
         if is_valid_ip(host):
             addresses = [host]
         else:
             # gethostbyname doesn't take callback as a kwarg
-            fut = Future()  # type: Future[Tuple[Any, Any]]
+            fut: Future[tuple[Any, Any]] = Future()
             self.channel.gethostbyname(
                 host, family, lambda result, error: fut.set_result((result, error))
             )
             result, error = yield fut
             if error:
-                raise IOError(
+                raise OSError(
                     "C-Ares returned error %s: %s while resolving %s"
                     % (error, pycares.errno.strerror(error), host)
                 )
@@ -86,7 +86,7 @@ class CaresResolver(Resolver):
             else:
                 address_family = socket.AF_UNSPEC
             if family != socket.AF_UNSPEC and family != address_family:
-                raise IOError(
+                raise OSError(
                     "Requested socket family %d but got %d" % (family, address_family)
                 )
             addrinfo.append((typing.cast(int, address_family), (address, port)))

@@ -9,26 +9,21 @@ single file without encoding.
 See also file_receiver.py in this directory, a server that receives uploads.
 """
 
+import asyncio
 import mimetypes
 import os
 import sys
 from functools import partial
+from urllib.parse import quote
 from uuid import uuid4
 
-try:
-    from urllib.parse import quote
-except ImportError:
-    # Python 2.
-    from urllib import quote
-
-from tornado import gen, httpclient, ioloop
+from tornado import httpclient
 from tornado.options import define, options
 
 
 # Using HTTP POST, upload one or more files in a single multipart-form-encoded
 # request.
-@gen.coroutine
-def multipart_producer(boundary, filenames, write):
+async def multipart_producer(boundary, filenames, write):
     boundary_bytes = boundary.encode()
 
     for filename in filenames:
@@ -43,29 +38,28 @@ def multipart_producer(boundary, filenames, write):
             + (b"Content-Type: %s\r\n" % mtype.encode())
             + b"\r\n"
         )
-        yield write(buf)
+        await write(buf)
         with open(filename, "rb") as f:
             while True:
                 # 16k at a time.
                 chunk = f.read(16 * 1024)
                 if not chunk:
                     break
-                yield write(chunk)
+                await write(chunk)
 
-        yield write(b"\r\n")
+        await write(b"\r\n")
 
-    yield write(b"--%s--\r\n" % (boundary_bytes,))
+    await write(b"--%s--\r\n" % (boundary_bytes,))
 
 
 # Using HTTP PUT, upload one raw file. This is preferred for large files since
 # the server can stream the data instead of buffering it entirely in memory.
-@gen.coroutine
-def post(filenames):
+async def post(filenames):
     client = httpclient.AsyncHTTPClient()
     boundary = uuid4().hex
     headers = {"Content-Type": "multipart/form-data; boundary=%s" % boundary}
     producer = partial(multipart_producer, boundary, filenames)
-    response = yield client.fetch(
+    response = await client.fetch(
         "http://localhost:8888/post",
         method="POST",
         headers=headers,
@@ -75,8 +69,7 @@ def post(filenames):
     print(response)
 
 
-@gen.coroutine
-def raw_producer(filename, write):
+async def raw_producer(filename, write):
     with open(filename, "rb") as f:
         while True:
             # 16K at a time.
@@ -85,18 +78,17 @@ def raw_producer(filename, write):
                 # Complete.
                 break
 
-            yield write(chunk)
+            await write(chunk)
 
 
-@gen.coroutine
-def put(filenames):
+async def put(filenames):
     client = httpclient.AsyncHTTPClient()
     for filename in filenames:
         mtype = mimetypes.guess_type(filename)[0] or "application/octet-stream"
         headers = {"Content-Type": mtype}
         producer = partial(raw_producer, filename)
         url_path = quote(os.path.basename(filename))
-        response = yield client.fetch(
+        response = await client.fetch(
             "http://localhost:8888/%s" % url_path,
             method="PUT",
             headers=headers,
@@ -115,4 +107,4 @@ if __name__ == "__main__":
         sys.exit(1)
 
     method = put if options.put else post
-    ioloop.IOLoop.current().run_sync(lambda: method(filenames))
+    asyncio.run(method(filenames))

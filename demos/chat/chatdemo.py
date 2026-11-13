@@ -15,10 +15,7 @@
 # under the License.
 
 import asyncio
-import tornado.escape
-import tornado.ioloop
-import tornado.locks
-import tornado.web
+import tornado
 import os.path
 import uuid
 
@@ -28,7 +25,21 @@ define("port", default=8888, help="run on the given port", type=int)
 define("debug", default=True, help="run in debug mode")
 
 
-class MessageBuffer(object):
+def is_local_url(url):
+    r"""Returns True if ``url`` is a path on this site (not a different host).
+
+    Browsers ignore tabs and newlines and treat backslashes like slashes, so
+    "/\evil.com" and "/\t/evil.com" both mean "//evil.com", which is another
+    host. Redirecting to a URL that fails this check could be an open redirect
+    vulnerability (https://cwe.mitre.org/data/definitions/601.html).
+    """
+    url = url.strip("".join(chr(i) for i in range(0x21)))
+    url = url.replace("\t", "").replace("\n", "").replace("\r", "")
+    url = url.replace("\\", "/")
+    return url.startswith("/") and not url.startswith("//")
+
+
+class MessageBuffer:
     def __init__(self):
         # cond is notified whenever the message cache is updated
         self.cond = tornado.locks.Condition()
@@ -74,8 +85,10 @@ class MessageNewHandler(tornado.web.RequestHandler):
         message["html"] = tornado.escape.to_unicode(
             self.render_string("message.html", message=message)
         )
-        if self.get_argument("next", None):
-            self.redirect(self.get_argument("next"))
+        if next := self.get_argument("next", None):
+            if not is_local_url(next):
+                raise tornado.web.HTTPError(400)
+            self.redirect(next)
         else:
             self.write(message)
         global_message_buffer.add_message(message)
@@ -107,7 +120,7 @@ class MessageUpdatesHandler(tornado.web.RequestHandler):
         self.wait_future.cancel()
 
 
-def main():
+async def main():
     parse_command_line()
     app = tornado.web.Application(
         [
@@ -122,8 +135,8 @@ def main():
         debug=options.debug,
     )
     app.listen(options.port)
-    tornado.ioloop.IOLoop.current().start()
+    await asyncio.Event().wait()
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
